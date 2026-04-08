@@ -1,0 +1,1 @@
+/usr/bin/g++  -Wall -Werror -g CMakeFiles/test_fk.dir/tests/test_fk.cpp.o -o test_fk  libkinova_kinematics.a 
