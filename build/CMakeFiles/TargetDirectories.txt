@@ -1,4 +1,0 @@
-/home/sahil/kinova_learning/kinova_kinematics/build/CMakeFiles/kinova_kinematics.dir
-/home/sahil/kinova_learning/kinova_kinematics/build/CMakeFiles/test_fk.dir
-/home/sahil/kinova_learning/kinova_kinematics/build/CMakeFiles/edit_cache.dir
-/home/sahil/kinova_learning/kinova_kinematics/build/CMakeFiles/rebuild_cache.dir

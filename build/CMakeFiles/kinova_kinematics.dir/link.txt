@@ -1,2 +1,0 @@
-/usr/bin/ar qc libkinova_kinematics.a CMakeFiles/kinova_kinematics.dir/src/KinovaKinematics.cpp.o
-/usr/bin/ranlib libkinova_kinematics.a
