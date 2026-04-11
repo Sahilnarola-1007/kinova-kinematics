@@ -1,6 +1,7 @@
 #include <kinova_kinematics/KinovaKinematics.hpp>
 #include <iostream>
 #include <array>
+#include<random>
 
 int main() {
     KinovaKinematics fk;
@@ -33,5 +34,38 @@ int main() {
     std::cout << "-0.3: " << p2.transpose() << std::endl;
     // Expect: z equal, x opposite sign
 
+    // Test 4: Jacobian at home position
+        std::cout << "\n=== Jacobian at Zero Config ===" << std::endl;
+        auto J = fk.computeJacobian(zero);
+        std::cout << J << std::endl;
+    
+    // Round-trip test
+    std::cout << "\n=== IK Round-Trip Test ===" << std::endl;
+    std::mt19937 rng(42);
+    std::uniform_real_distribution<double> dist(-1.5, 1.5);
+
+    int success = 0;
+    for(int t = 0; t < 100; t++){
+        // Random joint config
+        std::array<double,7> q_rand;
+        for(auto& v : q_rand) v = dist(rng);
+
+        // FK → target pose
+        Eigen::Matrix4d target = fk.computeFK(q_rand);
+
+        // IK from zero guess
+        std::array<double,7> zero_guess = {0,0,0,0,0,0,0};
+        IKResult result = fk.solveIK(target, zero_guess);
+
+        if(result.success){
+            // FK again to verify
+            Eigen::Matrix4d T_check = fk.computeFK(result.joint_states);  // ← correct field name
+            double pos_err = (T_check.block<3,1>(0,3) - target.block<3,1>(0,3)).norm();
+            if(pos_err < 1e-3) success++;
+        }
+    }
+
+    std::cout << "Passed: " << success << "/100" << std::endl;
+    std::cout << "Expect: 90+/100" << std::endl;
     return 0;
 }
