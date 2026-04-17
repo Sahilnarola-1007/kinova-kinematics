@@ -21,7 +21,9 @@ KinovaKinematics::KinovaKinematics():
             {PI/2, 0.0, -0.3143, PI},
             {PI/2, 0.0,  0.0,    PI},
             {PI,   0.0, -0.1674, PI}
-            }}
+            }},
+            joint_min_{-2*PI,-2.2497,-2*PI,-2.5795,-2*PI,-2.0996311,-2*PI},
+            joint_max_{2*PI,2.2497,2*PI,2.5795,2*PI,2.0996311,2*PI}
             {}
 
 Matrix4d KinovaKinematics::dhTransform(double alpha, double a,
@@ -62,7 +64,11 @@ Matrix4d KinovaKinematics::computeFK(const std::array<double, 7> &joint_angles){
         T = T * Temp;
     }
 
+    Eigen::Matrix4d T_tool = Eigen::Matrix4d::Identity();
+    T_tool(2, 3) = 0.12;  // tool offset along local z-axis
+    T = T * T_tool;
     return T;
+    
 }
 
 Vector3d KinovaKinematics::getPosition(const Matrix4d &transform){
@@ -128,17 +134,21 @@ IKResult KinovaKinematics::solveIK(
             double position_tol,
             double orientation_tol){
 
-    double lambda = 0.01;  // damping factor — prevents dq explosion near singularities
+    //double lambda = 0.5;  // damping factor — prevents dq explosion near singularities
+    double alpha=0.5;      //gain
     std::array<double,7> joint_angles = initial_guess;
 
     Matrix4d current_pose;
     Matrix3d R_current, R_target, R_delta;  // rotation matrices for orientation error
     Vector3d dx, P_current, P_target, dw;
-    Eigen::VectorXd dq(7);
+    Eigen::VectorXd dq(7),z0(7);
     Eigen::VectorXd de(6);                                      // stacked error: [dp; dw] (6x1)
     Eigen::MatrixXd A = Eigen::MatrixXd::Zero(6, 6);
+    Eigen::MatrixXd N = Eigen::MatrixXd::Zero(7, 7);
+    Eigen::MatrixXd I_7 = Eigen::MatrixXd::Identity(7, 7);       // null space projector identity
     Eigen::MatrixXd J = Eigen::MatrixXd::Zero(6, 7);
-    Eigen::MatrixXd I = Eigen::MatrixXd::Identity(6, 6);       // damping identity matrix
+    Eigen::MatrixXd J_pinv = Eigen::MatrixXd::Zero(7,6);
+    Eigen::MatrixXd I_6 = Eigen::MatrixXd::Identity(6, 6);       // damping identity matrix
 
     int i = 0;
     while(i < max_iterations){
@@ -172,12 +182,24 @@ IKResult KinovaKinematics::solveIK(
         de.block<3,1>(0,0) = dx;  // position error (rows 0-2)
         de.block<3,1>(3,0) = dw;  // orientation error (rows 3-5)
 
+        double lambda = 0.5 * de.norm() + 1e-4;
+
         // Step 7: damped least squares — dq = Jt * (J*Jt + lambda^2 * I)^-1 * de
         A  = J * J.transpose();
-        A  = A + (lambda * lambda) * I;
-        dq = J.transpose() * A.inverse() * de;
+        A  = A + (lambda * lambda) * I_6;
+        J_pinv = J.transpose()*A.inverse(); //damped pseudoinverse 
+        dq = J_pinv* de; //7x1
 
-        // Step 8: update joint angles
+        //Step 8: Null-space projector
+        N = I_7 - J_pinv * J;
+
+        //Step 9:Secondary gradient
+        z0=jointLimitGradient(joint_angles);  //7x1
+        
+        // Step 10: add null-space term
+        dq = dq + alpha * N * z0;
+        
+        // Step 11: update joint angles with Null space
         for(int j=0; j<NUM_JOINTS; j++){
             joint_angles[j] = joint_angles[j] + dq(j);
         }
@@ -191,3 +213,17 @@ IKResult KinovaKinematics::solveIK(
 
     return {false, joint_angles, dx.norm(), dw.norm()};
 }
+
+Eigen::VectorXd KinovaKinematics::jointLimitGradient(const std::array<double,7> & joint_angles){
+
+    //z0= 7x1 vector
+    Eigen::VectorXd z0(7);
+    double q_mid{};
+
+    for(int i=0;i<NUM_JOINTS;i++){
+        q_mid=(joint_max_[i]+joint_min_[i])/2;
+        z0(i)=(q_mid-joint_angles[i])/((joint_max_[i]-joint_min_[i])*(joint_max_[i]-joint_min_[i]));
+    }
+
+    return z0;
+} 

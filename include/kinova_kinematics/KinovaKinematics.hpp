@@ -72,7 +72,7 @@ class KinovaKinematics{
          * @brief Solve IK using damped least squares (Levenberg-Marquardt).
          * @param target_pose Desired EE pose as 4x4 homogeneous transform.
          * @param initial_guess Starting joint configuration (radians).
-         * @param max_iterations Maximum solver iterations (default: 100).
+         * @param max_iterations Maximum solver iterations (default: 300).
          * @param position_tol Convergence threshold for position error in meters (default: 1e-4 = 0.1mm).
          * @param orientation_tol Convergence threshold for orientation error in radians (default: 1e-3 ≈ 0.057°).
          * @return IKResult with success flag, joint angles, and final errors.
@@ -80,7 +80,7 @@ class KinovaKinematics{
         IKResult solveIK(
             const Eigen::Matrix4d& target_pose,
             const std::array<double,7> &initial_guess,
-            int max_iterations=100,
+            int max_iterations=300,
             double position_tol=1e-4,
             double orientation_tol=1e-3
         );
@@ -97,7 +97,13 @@ class KinovaKinematics{
          * @return 4x4 homogeneous transform from frame (i-1) to frame (i).
          */
         Eigen::Matrix4d dhTransform(double alpha, double a, double d, double theta);
-
+        
+        // Z0=pushes each angle towards its center
+        Eigen::VectorXd jointLimitGradient(const std::array<double,7> & joint_angles);
+        
         // Classical DH table: 8 rows (row 0 = base frame, rows 1-7 = joints 1-7)
         std::array<DHParam,8> dh_params_;
+
+        std::array<double,7> joint_min_;
+        std::array<double,7> joint_max_;
 };
