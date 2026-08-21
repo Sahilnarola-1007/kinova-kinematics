@@ -9,9 +9,18 @@ using Eigen::Matrix4d;
 using Eigen::Matrix3d;
 using Eigen::Vector3d;
 
-constexpr double PI = 3.141592653589793;  // file-scope constant, not exposed in header
 
-KinovaKinematics::KinovaKinematics():
+namespace {
+    // Local to this translation unit — no header pollution, no M_PI dependency
+    // (M_PI is POSIX, not ISO C++, and -Wpedantic is on).
+    constexpr double PI       = 3.14159265358979323846;
+    constexpr double kDegToRad = PI / 180.0;
+    constexpr double kRadToDeg = 180.0 / PI;
+    }  // namespace
+
+//constexpr double PI = 3.141592653589793;  // file-scope constant, not exposed in header
+
+KinovaKinematics::KinovaKinematics(double tool_offset_z):
     dh_params_{
             {{PI,   0.0,  0.0,    0.0},
             {PI/2, 0.0, -0.2848, 0.0},
@@ -27,7 +36,7 @@ KinovaKinematics::KinovaKinematics():
             {}
 
 Matrix4d KinovaKinematics::dhTransform(double alpha, double a,
-                                        double d, double theta){
+                                        double d, double theta)const{
     double ct=std::cos(theta);
     double st=std::sin(theta);
     double ca=std::cos(alpha);
@@ -44,10 +53,12 @@ Matrix4d KinovaKinematics::dhTransform(double alpha, double a,
     return T;
 }
 
-Matrix4d KinovaKinematics::computeFK(const std::array<double, 7> &joint_angles){
+Matrix4d KinovaKinematics::computeFK(const std::array<double, 7> &joint_angles) const{
 
     Matrix4d T, Temp;
     double theta;
+
+        T_tool(2, 3) = tool_offset_z_;  // tool offset from ctor param, local z-axis
 
     // Row 0: base frame transform (no joint angle)
     T = dhTransform(dh_params_[0].alpha, dh_params_[0].a,
@@ -65,28 +76,31 @@ Matrix4d KinovaKinematics::computeFK(const std::array<double, 7> &joint_angles){
     }
 
     Eigen::Matrix4d T_tool = Eigen::Matrix4d::Identity();
-    T_tool(2, 3) = 0.12;  // tool offset along local z-axis
+    
+    // distance from tool frame origin to tip of the tool, 
+    //the point we calculate FK w.r.t 
+    T_tool(2, 3) = 0.113;  // tool offset along local z-axis
     T = T * T_tool;
     return T;
     
 }
 
-Vector3d KinovaKinematics::getPosition(const Matrix4d &transform){
+Vector3d KinovaKinematics::getPosition(const Matrix4d &transform) const{
     return {transform(0,3),
             transform(1,3),
             transform(2,3)};
 }
 
-Matrix3d KinovaKinematics::getRotation(const Matrix4d &transform){
+Matrix3d KinovaKinematics::getRotation(const Matrix4d &transform) const{
     return transform.block<3,3>(0,0);
 }
 
-Eigen::MatrixXd KinovaKinematics::computeJacobian(const std::array<double,7> &joint_angles){
+Eigen::Matrix<double,6,7> KinovaKinematics::computeJacobian(const std::array<double,7> &joint_angles) const{
 
-    Eigen::MatrixXd J = Eigen::MatrixXd::Zero(6, 7);  // 6x7 Jacobian, initialized to zero
+    Eigen::Matrix<double,6,7> J = Eigen::Matrix<double,6,7>::Zero();  // 6x7 Jacobian, initialized to zero
 
     // Finite difference step — small enough for accuracy, large enough for float precision
-    double eps = 1e-6;
+    constexpr double eps = 1e-6;
 
     std::array<double,7> perturbed_joint_angles;
     Matrix4d T0, T1;
@@ -127,12 +141,101 @@ Eigen::MatrixXd KinovaKinematics::computeJacobian(const std::array<double,7> &jo
     return J;
 }
 
+DlsResult KinovaKinematics::solveDLS(const Eigen::Matrix<double,6,7>& J,
+                                const Eigen::Matrix<double,6,1>& twist_des,
+                                double lambda) const
+{
+
+    //constructing the output struct with default values
+    DlsResult out;
+    // Guard: lambda must be strictly positive.
+    //
+    // With lambda > 0, A is provably symmetric positive definite for EVERY
+    // configuration:  xᵀAx = ‖Jᵀx‖² + λ²‖x‖² ≥ λ²‖x‖² > 0.  Singularity makes A
+    // ill-CONDITIONED, never indefinite. With lambda == 0, A = J·Jᵀ is only
+    // positive SEMI-definite and is genuinely rank-deficient at a singularity —
+    // which is the one case the factorisation cannot survive. So this test is
+    // not guarding the geometry, it is guarding against a config typo.
+    //
+    // checks lambda, must be > 0 and finite
+    if (!(lambda > 0.0) || !std::isfinite(lambda)) 
+        return out;
+
+    // Guard: finite inputs. A dropped or partially-parsed BaseCyclic frame puts
+    // NaN into q_meas, and NaN propagates silently all the way to the wire.
+    // Checking ldlt.info() alone is NOT sufficient — it reports on the
+    // factorisation, and whether Eigen flags a NaN-filled matrix is UNVERIFIED.
+    // Hence explicit finiteness checks on both ends. (Unit test: DlsRejectsNan.)
+    if (!J.allFinite() || !twist_des.allFinite()) 
+        return out;
+
+    // A = J·Jᵀ + λ²·I₆   — 6x6, fixed size, stack-allocated, no heap in the
+    // 1 kHz path. noalias() suppresses the temporary Eigen would otherwise
+    // create for the product.
+    Eigen::Matrix<double,6,6> A;
+    A.noalias() = J * J.transpose();
+    A.diagonal().array() += lambda * lambda;
+
+    // LDLᵀ rather than an explicit inverse: backward-stable,
+    // and the pivot diagonal D is a free conditioning indicator for later.
+    // Solving the 6x6 system is why this is cheap — the 7x6 damped pseudoinverse
+    // is never formed.
+    const Eigen::LDLT<Eigen::Matrix<double,6,6>> ldlt(A);
+    if (ldlt.info() != Eigen::Success) 
+        return out;
+
+    const Eigen::Matrix<double,6,1> y = ldlt.solve(twist_des);
+    if (!y.allFinite()) 
+        return out;
+
+    out.lambda_used = lambda;
+    out.qdot.noalias() = J.transpose() * y;   // [rad/s], 7x1
+
+    //calculating twst_achieved = J*qdot
+    out.twist_achieved.noalias() = J * out.qdot;
+    
+    out.ok = true;
+    return out;
+}
+
+DlsResult KinovaKinematics::jointVelocityDLS(
+        const std::array<double,7>& q_meas_rad,
+        const Eigen::Matrix<double,6,1>& twist_des,
+        double lambda) const
+{
+    // Default-constructed: q_dot all zeros, ok == false. Every early return
+    // below therefore commands zero joint motion, not stale or partial values.
+    DlsResult result;
+
+    // the DH table and Jacobian are defined on radians.
+    
+    for (int i = 0; i < NUM_JOINTS; ++i) {
+        if (!std::isfinite(q_meas_rad[i])) 
+            return result;   // reject before it spreads
+    }
+
+    // Jacobian at the MEASURED configuration. Rows 0-2 are m/rad, rows 3-5 are
+    // dimensionless — the mixed units are why a single scalar lambda is not
+    // dimensionally consistent across all six rows. Acknowledged in design.md;
+    // it is a known and accepted approximation, not an oversight.
+    const Eigen::Matrix<double,6,7> J = computeJacobian(q_meas_rad);
+
+    return solveDLS(J, twist_des, lambda);
+
+}
+
 IKResult KinovaKinematics::solveIK(
             const Eigen::Matrix4d& target_pose,
             const std::array<double,7> &initial_guess,
             int max_iterations,
             double position_tol,
-            double orientation_tol){
+            double orientation_tol) const{
+
+    // Reject non-positive iteration counts up front: the loop would never run,
+    // leaving the error terms undefined. -1.0 norms signal "did not run".
+    if (max_iterations <= 0) {
+        return {false, initial_guess, -1.0, -1.0};
+    }
 
     //double lambda = 0.5;  // damping factor — prevents dq explosion near singularities
     double alpha=0.5;      //gain
@@ -140,9 +243,10 @@ IKResult KinovaKinematics::solveIK(
 
     Matrix4d current_pose;
     Matrix3d R_current, R_target, R_delta;  // rotation matrices for orientation error
-    Vector3d dx, P_current, P_target, dw;
+    Vector3d dx,dw ;  // position and orientation error vectors
+    Vector3d P_current, P_target;  // position vectors of current and target
     Eigen::VectorXd dq(7),z0(7);
-    Eigen::VectorXd de(6);                                      // stacked error: [dp; dw] (6x1)
+    Eigen::VectorXd de = Eigen::VectorXd::Zero(6);;                                      // stacked error: [dp; dw] (6x1)
     Eigen::MatrixXd A = Eigen::MatrixXd::Zero(6, 6);
     Eigen::MatrixXd N = Eigen::MatrixXd::Zero(7, 7);
     Eigen::MatrixXd I_7 = Eigen::MatrixXd::Identity(7, 7);       // null space projector identity
@@ -214,9 +318,9 @@ IKResult KinovaKinematics::solveIK(
     return {false, joint_angles, dx.norm(), dw.norm()};
 }
 
-Eigen::VectorXd KinovaKinematics::jointLimitGradient(const std::array<double,7> & joint_angles){
+Eigen::VectorXd KinovaKinematics::jointLimitGradient(const std::array<double,7> & joint_angles) const{
 
-    //z0= 7x1 vector
+    //z0 = 7x1 vector, null space gradient that pushes each joint angle towards its center
     Eigen::VectorXd z0(7);
     double q_mid{};
 

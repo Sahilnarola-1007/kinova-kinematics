@@ -39,4 +39,17 @@ ament_export_include_directories(include)
 add_executable(test_fk tests/test_fk.cpp)
 target_link_libraries(test_fk kinova_kinematics)
 
+# Latency benchmark (Step 6.2) — plain executable, run pinned + real-time
+add_executable(benchmark_dls tests/benchmark_dls.cpp)
+target_link_libraries(benchmark_dls kinova_kinematics)
+
+if(BUILD_TESTING)
+
+  find_package(ament_cmake_gtest REQUIRED)
+
+  ament_add_gtest(test_dls tests/test_dls.cpp)
+  target_link_libraries(test_dls kinova_kinematics)
+  target_compile_features(test_dls PRIVATE cxx_std_17)
+endif()
+
 ament_package()
