@@ -1,0 +1,211 @@
+/**
+ * @file SafetyFilter.cpp
+ * @brief Three-site safety filter implementation (Step 6.4).
+ *        Hot-path: no allocation, no logging, no locks, no exceptions.
+ *
+ * @author Sahil Narola
+ * @date   August 2026
+ */
+
+#include <kinova_kinematics/SafetyFilter.hpp>
+#include <algorithm>
+#include <cmath>
+
+// ── Construction ─────────────────────────────────────────────────────────────
+
+SafetyFilter::SafetyFilter(const SafetyBounds& bounds)
+    : bounds_(bounds)
+    , counter_{}
+{
+}
+
+// ── Site 1: clipForce ────────────────────────────────────────────────────────
+
+ForceFilterResult SafetyFilter::clipForce(double f_n_desired) const
+{
+
+    ForceFilterResult result;
+
+    if (!std::isfinite(f_n_desired))
+    {
+        result.value  = 0.0;
+        result.scale  = 0.0;   // NOTE: the value == scale * input invariant is
+                               // deliberately broken here — it cannot hold for NaN.
+        result.reason = FilterReason::NON_FINITE_REJECTED;
+        ++counter_.non_finite_rejected;
+        return result;
+    }
+    const double mag = std::abs(f_n_desired);
+
+    if (mag <= bounds_.f_n_max)
+    {
+        result.value  = f_n_desired;
+        result.scale  = 1.0;
+        result.reason = FilterReason::PASS;
+    }
+    else
+    {
+        result.scale  = bounds_.f_n_max / mag;
+        result.value  = f_n_desired * result.scale;
+        result.reason = FilterReason::FORCE_SCALED;
+        ++counter_.force_scaled;
+    }
+    return result;
+}
+
+// ── Site 2: clipCartesian ────────────────────────────────────────────────────
+
+CartesianFilterResult SafetyFilter::clipCartesian(
+    const Eigen::Matrix<double, 6, 1>& twist_task,
+    const Eigen::Vector3d& ee_pos_base) const
+{
+    CartesianFilterResult result;
+
+        if (!twist_task.allFinite() || !ee_pos_base.allFinite())
+    {
+        result.twist.setZero();
+        result.alpha = 0.0;
+        result.beta  = 0.0;
+        result.reasons[0] = FilterReason::NON_FINITE_REJECTED;
+        result.num_interventions = 1;
+        ++counter_.non_finite_rejected;
+        return result;
+    }
+
+    result.twist = twist_task;
+    int reason_idx = 0;
+
+    // Group A: tangential linear velocity [vx, vy] — vz excluded
+    const double vx = twist_task(0);
+    const double vy = twist_task(1);
+    const double v_tan_mag = std::sqrt(vx * vx + vy * vy);
+
+    if (v_tan_mag > bounds_.v_tan_max)
+    {
+        result.alpha = bounds_.v_tan_max / v_tan_mag;
+        result.twist(0) = vx * result.alpha;
+        result.twist(1) = vy * result.alpha;
+        result.reasons[reason_idx++] = FilterReason::V_TAN_SCALED;
+        ++result.num_interventions;
+        ++counter_.v_tan_scaled;
+    }
+
+    // Group B: angular velocity [wx, wy, wz]
+    const double wx = twist_task(3);
+    const double wy = twist_task(4);
+    const double wz = twist_task(5);
+    const double omega_mag = std::sqrt(wx * wx + wy * wy + wz * wz);
+
+    if (omega_mag > bounds_.omega_max)
+    {
+        result.beta = bounds_.omega_max / omega_mag;
+        result.twist(3) = wx * result.beta;
+        result.twist(4) = wy * result.beta;
+        result.twist(5) = wz * result.beta;
+        result.reasons[reason_idx++] = FilterReason::OMEGA_SCALED;
+        ++result.num_interventions;
+        ++counter_.omega_scaled;
+    }
+
+    // Workspace box: REFUSAL — zero outward component, allow inward
+    // First checks the workspace bounds and second checks if the twist 
+    //is gonna push the end-effector outside the workspace. If so, it sets the corresponding twist component to zero.
+    bool ws_hit = false;
+
+    if (ee_pos_base.x() < bounds_.ws_x_min && result.twist(0) < 0.0)
+        { result.twist(0) = 0.0; ws_hit = true; }
+    else if (ee_pos_base.x() > bounds_.ws_x_max && result.twist(0) > 0.0)
+        { result.twist(0) = 0.0; ws_hit = true; }
+
+    if (ee_pos_base.y() < bounds_.ws_y_min && result.twist(1) < 0.0)
+        { result.twist(1) = 0.0; ws_hit = true; }
+    else if (ee_pos_base.y() > bounds_.ws_y_max && result.twist(1) > 0.0)
+        { result.twist(1) = 0.0; ws_hit = true; }
+
+    // Z touches vz — workspace is safety-of-last-resort for ALL axes
+    if (ee_pos_base.z() < bounds_.ws_z_min && result.twist(2) < 0.0)
+        { result.twist(2) = 0.0; ws_hit = true; }
+    else if (ee_pos_base.z() > bounds_.ws_z_max && result.twist(2) > 0.0)
+        { result.twist(2) = 0.0; ws_hit = true; }
+
+   
+    if (ws_hit)
+    {
+        result.reasons[reason_idx++] = FilterReason::WORKSPACE_REFUSED;
+        ++result.num_interventions;
+        ++counter_.workspace_refused;
+    }
+
+    return result;
+}
+
+// ── Site 3: clipJoint ────────────────────────────────────────────────────────
+
+JointFilterResult SafetyFilter::clipJoint(
+    const Eigen::Matrix<double, 7, 1>& qdot,
+    const Eigen::Matrix<double, 7, 1>& q_send) const
+{
+    JointFilterResult result;
+
+    if (!qdot.allFinite() || !q_send.allFinite())
+    {
+        result.qdot.setZero();
+        result.vel_scale        = 0.0;
+        result.pos_refused_mask = 0;   // no joint hit a limit — the input was garbage
+        result.reasons[0]       = FilterReason::NON_FINITE_REJECTED;
+        result.num_interventions = 1;
+        ++counter_.non_finite_rejected;
+        return result;
+    }
+    result.qdot = qdot;
+    int reason_idx = 0;
+
+    // Velocity: uniform scaling of full q̇ vector
+    double alpha = 1.0;
+    for (int j = 0; j < 7; ++j)
+    {
+        const double mag = std::abs(qdot(j));
+        if (mag > bounds_.joint_vel_max[j])
+            alpha = std::min(alpha, bounds_.joint_vel_max[j] / mag);
+    }
+
+    if (alpha < 1.0)
+    {
+        result.qdot = qdot * alpha;
+        result.vel_scale = alpha;
+        result.reasons[reason_idx++] = FilterReason::JOINT_VEL_SCALED;
+        ++result.num_interventions;
+        ++counter_.joint_vel_scaled;
+    }
+
+    // Position: refusal via single-step lookahead (runs AFTER velocity scaling)
+    const double dt = bounds_.pos_lookahead_dt;
+    bool pos_hit = false;
+
+    for (int j = 0; j < 7; ++j)
+    {
+        const double v      = result.qdot(j);          // post-velocity-scaling
+        const double q_next = q_send(j) + v * dt;
+
+        // Directional: refuse only motion that drives FURTHER out of bounds.
+        // Already-outside + moving inward must pass, or the joint is stuck.
+        const bool over_high = (q_next > bounds_.joint_pos_max[j]) && (v > 0.0);
+        const bool over_low  = (q_next < bounds_.joint_pos_min[j]) && (v < 0.0);
+
+        if (over_high || over_low)
+        {
+            result.qdot(j) = 0.0;
+            result.pos_refused_mask |= (1u << j);
+            pos_hit = true;
+        }
+    }
+
+    if (pos_hit)
+    {
+        result.reasons[reason_idx++] = FilterReason::JOINT_POS_REFUSED;
+        ++result.num_interventions;
+        ++counter_.joint_pos_refused;
+    }
+
+    return result;
+}
