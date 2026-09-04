@@ -173,7 +173,7 @@ A single constant λ cannot satisfy both requirements at once:
 
 | λ | Behaviour near singularity | Behaviour in normal operation |
 |---|---|---|
-| Large (e.g. 0.29) | Tight velocity bound, safe | Heavily damped. At a typical σ ≈ 0.3, roughly half the commanded velocity is lost |
+| Large (e.g. 0.29) | Tight velocity bound, safe | Heavily damped. At the measured σ = 0.297 (§5.4.1) 49 % of the commanded velocity is lost; at the worst σ measured at that pose, 0.152, the loss is 78 % |
 | Small (e.g. 0.05) | BOUND-1 gives ‖q_dot‖ ≤ 10·‖v‖ — too loose to rely on | Accurate tracking |
 
 This is a known property of constant-λ DLS, not a defect in this design. The literature
@@ -221,6 +221,105 @@ dimensionally consistent. It changes the meaning of λ, so it must not be introd
 mid-sweep. Decide after the λ sweep, not during it.
 
 The same wart applies to the Yoshikawa manipulability measure in §8.
+
+*This is not an idiosyncratic worry.* Dimensional inhomogeneity of the Jacobian is a known
+obstacle to using the condition number as a measure of invertibility, and the "characteristic
+length" was introduced in the literature specifically to cope with it. Several selection
+criteria for that length exist (minimising the condition number; scaling by maximum desired
+forces). **References unverified — read the primary sources before citing.**
+
+### 5.4.1 λ is robot-specific — measured
+
+λ is a threshold on σ: the gain `g(σ) = σ/(σ²+λ²)` peaks at `σ = λ` (§5.2). λ is therefore
+only meaningful relative to the σ spectrum of *this* arm, and that spectrum depends on the
+arm's geometry.
+
+**σ has no consistent unit.** It is a ratio of task-space output to joint rate. For a
+translation-dominated singular direction that is m/rad; for a rotation-dominated one it is
+dimensionless; for a mixed direction it is neither. λ is compared against σ, so λ has no
+consistent unit either. This is the §5.4 defect restated in the form that matters for tuning.
+
+**Measured spectrum at `kHomeRad`** (`test_dls.cpp:122`, tool offset 0.113 m, reach 0.716 m).
+`u` is the left singular vector — the task-space direction that mode produces. "% linear" is
+`‖u_v‖²`, the translational share of that direction's energy. "Lost" is `λ²/(σ²+λ²)`, the
+fraction of commanded task velocity discarded by damping.
+
+| σ | % linear | lost at λ = 0.05 | lost at λ = 0.29 |
+|---|---|---|---|
+| 1.893 | 16 | 0.1 % | 2.3 % |
+| 1.798 | 19 | 0.1 % | 2.5 % |
+| 1.175 | 1 | 0.2 % | 5.7 % |
+| 0.297 | 99 | 2.8 % | 49 % |
+| 0.180 | 84 | 7.1 % | 72 % |
+| 0.152 | 80 | 9.7 % | 78 % |
+
+Two readings:
+
+- **Damping engages on translation, not rotation**, at this pose. The three rotation-dominated
+  modes lose under 0.3 % at λ = 0.05. This is the §5.4 defect in measured form.
+- §5.3's "typical σ ≈ 0.3" was optimistic: 0.297 is the *largest* of the three small values
+  here. `kHomeRad` is also not the worst pose observed — §12 records σ ≈ 0.105 elsewhere.
+
+#### Link-scale sensitivity — why λ does not transfer
+
+Same solver, same λ, geometrically similar arm of a different size. Joint configuration is
+**identical in every row** (`kHomeRad`); only the DH `d` values and the tool offset are
+multiplied by the link scale factor k.
+
+| Link scale factor k (all link lengths × this; k=1 is the real Gen3) | Tool reach ‖p‖ [m] | σ_min of the full 6×7 Jacobian | σ_min(k) ÷ σ_min(k=1) — how much σ_min actually shrank | k, for comparison — how much it *would* shrink if all of J scaled | Translational share ‖u_v‖² of that direction [%] | Rotational share ‖u_ω‖² [%] | Velocity lost along that direction at λ = 0.05 |
+|---|---|---|---|---|---|---|---|
+| 1.0 | 0.716 | 0.1519 | 1.0000 | 1.0000 | 80.1 | 19.9 | 9.8 % |
+| 0.5 | 0.358 | 0.0823 | 0.5418 | 0.5000 | 94.2 | 5.8 | 27.0 % |
+| 0.1 | 0.072 | 0.0169 | 0.1113 | 0.1000 | 99.8 | 0.2 | 89.7 % |
+
+Three findings:
+
+1. **σ_min shrinks with the arm, but not proportionally.** Columns 4 and 5 disagree: 0.1113
+   against 0.1000. Scaling the arm scales `Jv` by k and leaves `Jw` untouched, so only half
+   the matrix moves. "σ scales with link length" is *false* as a flat statement — only
+   translation-dominated σ scale, and only approximately.
+2. **The singular direction re-orients.** Column 6 runs 80.1 → 94.2 → 99.8 %. As `Jv` shrinks,
+   the worst direction becomes almost purely translational. No closed-form correction factor
+   exists; the SVD must be recomputed, not rescaled.
+3. **A fixed λ becomes destructive on a smaller arm.** The λ = 0.05 that costs 9.8 % on the
+   Gen3 costs 89.7 % on a tenth-scale arm at the *same* joint configuration — a configuration
+   nowhere near a kinematic singularity.
+
+λ lives in the adapter, below the interface contract. A per-robot λ therefore does not weaken
+the architectural-portability claim; it is exactly the kind of robot-specific quantity the
+contract exists to keep below the boundary.
+
+#### Procedure for a new robot
+
+Derived from §5.2, not taken from the literature.
+
+1. **Measure the spectrum.** Sample poses the arm will actually visit, compute J, take the
+   SVD, record the distribution of the smallest translation-dominated σ.
+2. **Upper bound, from accuracy.** For a tolerable fractional velocity loss L:
+   `λ ≤ σ · sqrt(L / (1 − L))`. Gen3 check: σ = 0.152, L = 10 % → λ ≤ 0.0507. This reproduces
+   the shipped 0.05 and its 9.7 % loss.
+3. **Lower bound, from the velocity cap** — *only if damping is the sole limiter.* From
+   BOUND-1, `‖q̇‖ ≤ ‖v‖/(2λ)`, so `λ ≥ ‖v‖_max / (2·q̇_cap)`. Gen3 check:
+   0.559 / (2 × 2.094) = 0.133.
+4. **Verify by sweep** (§11 item 7) on the new arm.
+
+**Note that steps 2 and 3 are incompatible on the Gen3: 0.05 < 0.133.** That is deliberate,
+not an error. λ = 0.05 permits `‖q̇‖ ≤ 0.559/0.10 = 5.59 rad/s` against a 2.094 rad/s cap —
+which is why SafetyFilter Site 3 is measured firing at 3.39 rad/s in normal operation rather
+than acting as a last-resort guard. **λ buys accuracy; Site 3 enforces the cap.** Step 3 is
+binding only on a robot with no Site-3 equivalent.
+
+*Alternative, deferred:* adaptive λ keyed to an online σ_min estimate (Chiaverini et al. 1994;
+Maciejewski & Klein 1988 — **both unverified, read before citing**) removes per-robot tuning
+entirely. Cost is a σ_min estimate every cycle at 1 kHz, which is **not measured** and is a
+different and more expensive operation than the LDLᵀ solve in §6. Forcing trigger: decide
+before a second robot enters the MuJoCo environment.
+
+**Provenance for all numbers in §5.4.1.** COMPUTED, September 2026, by an independent Python
+reimplementation of the repo DH table — *not* by `computeJacobian`. Validated two ways: flange
+z = 1.1873 m at q = 0 (matches the C++ FK), and analytic `Jv` versus central finite difference
+agreeing to 1.4e-10 at a random non-singular pose. **Not yet reproduced from `computeJacobian`
+in C++** — do that before citing externally.
 
 ---
 
@@ -339,6 +438,8 @@ The cycle is 1000 µs. Measured on hardware, the `Refresh()` UDP round-trip cons
 approximately 350 µs mean. That leaves roughly 650 µs, from which the IK, the admittance
 reflex, the safety filter and the observation build must all be paid.
 
+### 9.1 Inverse kinematics — `jointVelocityDLS`
+
 Per call, `jointVelocityDLS` costs: one numerical Jacobian (7 perturbation FK evaluations
 plus the base FK, so 8 DH chain evaluations), one 6×7 · 7×6 product, one 6×6 LDLᵀ
 factorisation and solve, one 7×6 matrix–vector product.
@@ -361,6 +462,51 @@ headroom. The tight p99.9-vs-mean gap is the evidence that the fixed-size path d
 heap-allocate. The dominant term is expected to be the numerical Jacobian, not the linear
 algebra, but the Jacobian/solve **split is not separately measured** — that remains an
 expectation, to be split at 6.5 only if a budget problem ever appears (it has not).
+
+**Build flags are part of the number.** `-O2 -g -DNDEBUG -std=gnu++17`, confirmed in
+`compile_commands.json` on 4 Sep 2026. Eigen relies on inlining to collapse expression
+templates; at `-O0` that collapse does not happen and the measurement is meaningless.
+
+### 9.2 Safety filter — three sites
+
+**Measured — Step 6.4** (`benchmark_safety_filter`, N = 1,000,000 per scenario, identical
+protocol to §9.1 — same build type, same `chrt -f 80 taskset -c 2`, which is what makes the
+two numbers additive). Four scenarios, because the filter has data-dependent branches and
+therefore no single worst case. Full rationale and bounds: `safety_filter.md`.
+
+Two runs of identical code, 4 Sep 2026, all values in ns:
+
+| Scenario | mean | batched | p50 | p99 | p99.9 | max |
+|---|---:|---:|---:|---:|---:|---:|
+| NOMINAL | 20.7 / 21.0 | 10.1 / 10.0 | 21 | 26 / 27 | 33 / 35 | 1623 |
+| ALL_TRIP | 30.5 / 30.2 | 15.2 / 15.0 | 30 | 35 / 36 | 38 / 39 | 964 |
+| ALTERNATING | 25.6 | 12.5 / 12.6 | 27 / 28 | 34 / 35 | 36 / 40 | 6851 |
+| NON_FINITE | 12.6 | 5.0 / 5.1 | 13 | 14 | 26 / 21 | 7338 |
+
+Clock-read floor 9 ns in both runs.
+
+**Reportable: worst p99.9 ≤ 40 ns across runs = 0.004 % of the cycle.** The filter is free.
+Any future argument about filter complexity is a correctness argument, never a latency one.
+
+**Reading the two mean columns.** `batched` divides one pair of clock reads across 64
+cycles, so it excludes clock overhead — but the 64 cycles run back to back, which the real
+loop never does. `mean` is per-iteration, so it excludes that effect but pays one ~9 ns
+clock read the real loop never pays. **The true single-cycle cost is bracketed between
+them: roughly 5–30 ns.** Both bounds are negligible against 1000 µs.
+
+**Do not name a worst-case scenario.** The label moved between the two runs (ALTERNATING
+at 40 ns, then ALL_TRIP at 38 ns) on identical code. The four scenarios are separated by
+1–5 ns at a 9 ns clock resolution — indistinguishable in the tail. The branch-predictor
+hypothesis behind ALTERNATING is neither supported nor refuted by this data. The
+defensible claim is a bound, not a ranking. The `max` column is dominated by OS events,
+not filter work: the outlier landed on NOMINAL in one run and NON_FINITE in the other.
+
+### 9.3 Composed cost — estimate only
+
+1.90 µs + 40 ns ≈ **1.9 µs, ~0.19 % of the cycle.** This is a go/no-go estimate, not a
+result. The p99.9 of a sum is not the sum of the p99.9s — that treats the two tails as
+perfectly correlated, which is conservative but not measured. The reportable composed
+number must come from instrumenting the assembled 1 kHz loop end to end.
 
 ---
 
@@ -410,6 +556,13 @@ the linear algebra directly testable with an injected `J` (D-26).
 **Robustness**
 8. NaN twist, NaN `q_meas`, λ = 0 / negative / ±∞ — all handled per §10 (`DlsRejectsNan`).
 
+**Fixture choice — `q = 0` is a singularity.** Computed from this library's DH table, the
+all-zeros configuration has **rank 3**, with three singular values exactly zero. It must not be
+used as a fixture for anything conditioning-related, nor as the initialisation pose for the
+1 kHz loop or a mock run. It remains valid as an FK fixture (z = 1.1873 m) — a different
+claim, since an FK check at a singular pose validates the DH table and says nothing about the
+Jacobian.
+
 **Determinism.** No randomness, or fixed logged seed.
 
 ---
@@ -418,13 +571,15 @@ the linear algebra directly testable with an injected `J` (D-26).
 
 | Item | Status | Blocks |
 |---|---|---|
-| Production λ | Provisional 0.05; set by the 6.4 sweep. Note: at σ ≈ 0.105 (ordinary pose) attenuation is 0.81 — ~19 % lost, 0.05 may be too aggressive | Hardware integration (6.6+) |
-| Tool offset as config parameter | Value 0.113 m applied, but still a **literal** in `computeFK`. D-14 requires it be a config parameter | Any reported hardware FK/IK number |
+| Production λ | Provisional 0.05; set by the 6.4 sweep. At σ ≈ 0.105 (ordinary pose) attenuation is 0.81 — ~19 % lost. Selection procedure and link-scale sensitivity: §5.4.1 | Hardware integration (6.6+) |
+| Tool offset as config parameter | **Resolved Sep 2026.** Constructor parameter `tool_offset_z`, stored as `tool_offset_z_`, applied in `computeFK`. Default 0.113 m; Kortex is configured at 0.12 m — the 7 mm gap is bookkeeping by construction, not FK error (D-14) | Closed |
 | Jacobian/solve timing split | Total measured (§9); split not measured | 6.5, only if a budget problem appears |
 | Manipulability metric | Deferred to 6.5 on measured timing; field stays NaN | 6.5 |
 | Mixed-units λ (§5.4) | Documented, not fixed. Weighted-Jacobian proposal deferred | Nothing in v1 |
 | `solveIK` `dx`/`dw` guard | `Vector3d dx, dw;` uninitialised; UB if `max_iterations ≤ 0`. Zero-init or guard | Before `solveIK` is relied on |
-| Joint velocity limits | **Not in this library.** Position limits hardcoded from the datasheet; velocity limits not. Verify against the Gen3 user guide | SafetyFilter |
+| Joint velocity limits | **Resolved Aug 2026.** 120 °/s joints 1–4, 200 °/s joints 5–7; now in `SafetyBounds::joint_vel_max`. Still not in this library — `jointVelocityDLS` is deliberately unlimited (§7) | Closed |
+| Joint position limit duplication | Limits exist in `KinovaKinematics.cpp` (2.2497 / 2.5795 / 2.0996311) **and** `SafetyFilter.hpp` (2.2515 / 2.5800 / 2.0996) — drifted at the 4th decimal. Worse, the two files use **different sentinels** for the continuous joints: ±2π here, ±1e9 in the filter. Those are not equivalent — 2π refuses at 6.28 rad, 1e9 never refuses. Harmless today (`jointVelocityDLS` is deliberately unlimited, §7, and only the filter enforces), but the verified `pos_refused_mask == 42` invariant holds **only** under the 1e9 sentinel. A manifest that adopts ±2π makes the mask 127 and breaks the invariant silently. Single manifest required — D-27 | Manifest schema |
+| Adaptive λ | Deferred. Removes per-robot tuning; cost unmeasured. §5.4.1 | Second robot in MuJoCo |
 
 ---
 
@@ -432,17 +587,30 @@ the linear algebra directly testable with an injected `J` (D-26).
 
 | Claim | Basis |
 |---|---|
-| Classical DH is the correct convention for the Gen3 | z = 1.1873 m at home (analytic FK); symmetry checks pass. **Hardware FK-vs-Kortex comparison pending D-14** |
+| Classical DH is the correct convention for the Gen3 | Flange z = 1.1873 m at **q = 0** (all joints zero, analytic FK, before tool offset); symmetry checks pass. q = 0 is itself singular (§11), so this validates the DH table only. **Hardware FK-vs-Kortex comparison pending D-14** |
 | `J` is 6×7 and the system is underdetermined | Structural, from the 7-DOF arm |
 | `g_max = 1/(2λ)` at `σ = λ` | **Derived**, §5.2. Reproducible by hand. |
 | LDLᵀ needs no matrix inverse | Property of the factorisation |
-| `jointVelocityDLS` mean 1.90 µs / p99.9 3.04 µs | **Measured**, Step 6.2 (§9), N = 10⁶, RT + pinned |
+| `jointVelocityDLS` mean 1.90 µs / p99.9 3.04 µs | **Measured**, Step 6.2 (§9.1), N = 10⁶, RT + pinned |
+| Benchmark build flags `-O2 -g -DNDEBUG` | **Verified** 4 Sep 2026 from `compile_commands.json`, both benchmark targets |
+| SafetyFilter worst p99.9 ≤ 40 ns | **Measured**, Step 6.4 (§9.2), N = 10⁶ per scenario × 4 scenarios, two runs, same protocol as 6.2 |
+| SafetyFilter true single-cycle cost 5–30 ns | **Bracketed**, not measured directly — batched and per-iteration means bound it from below and above (§9.2) |
+| No scenario is the filter's worst case | **Measured.** Label moved between two runs of identical code; spread 1–5 ns at 9 ns clock resolution |
+| Non-finite guard fires at all three sites | **Measured.** `non_finite_rejected` = 3,000,000 = 3 × N under NON_FINITE, asserted by the benchmark |
+| Only joints 2, 4, 6 can position-refuse | **Measured.** `pos_refused_mask` = 42 (`0b0101010`) under ALL_TRIP and ALTERNATING; continuous-rotation sentinels never refuse |
+| NOMINAL path is filter-silent | **Measured.** All counters 0 over 10⁶ cycles with inputs inside every bound — the D-09 premise |
+| Composed IK + filter cost ~1.9 µs | **Estimate only.** Sum of two independently measured p99.9 values; tails assumed correlated. Not measured end to end (§9.3) |
 | No heap allocation on the 1 kHz path | Inferred from the tight p99.9-vs-mean gap; fixed-size Eigen throughout |
 | `Refresh()` costs ~350 µs mean | **Measured on hardware**, Step 3 |
 | Numerical Jacobian dominates the per-call cost | **UNVERIFIED expectation.** Split not measured. |
-| Gen3 joint *velocity* limits | **UNVERIFIED.** Not in this library. Read from the Gen3 user guide before the SafetyFilter is written. |
+| Gen3 joint *velocity* limits | **[SPEC], Aug 2026.** 120 °/s joints 1–4, 200 °/s joints 5–7, from the Kortex actuator specification. Applied in `SafetyBounds`. **Not confirmed by hardware test.** |
+| `q = 0` is a singularity, rank 3 | **Computed** from this library's DH table. Three singular values exactly zero. |
+| σ spectrum and link-scale table (§5.4.1) | **Computed** by an independent reimplementation, not by `computeJacobian`. Cross-checks: FK z = 1.1873 at q = 0; analytic vs finite-difference `Jv` to 1.4e-10. **Not yet reproduced in C++.** |
+| λ selection formulae (§5.4.1 steps 2–3) | **Derived** from BOUND-1 (§5.2). Reproducible by hand. |
+| DLS literature references (§5.4.1) | **UNVERIFIED.** Found via search, primary sources not read. Do not cite without checking. |
 
 ---
 
 *Kinova Gen3 force-conditioned skills — Advanced Biomechatronics and Locomotion Lab,
-Carleton University. Phase 0, Step 6.2.*
+Carleton University. Phase 0, Steps 6.2 + 6.4 — IK and safety filter benchmarks closed,
+4 September 2026.*

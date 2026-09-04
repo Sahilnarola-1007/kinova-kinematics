@@ -35,10 +35,10 @@ struct DHParam
 };
 
 struct IKResult{
-    bool success;
-    std::array<double,7> joint_states;
-    double position_error;      // meters
-    double orientation_error;   // radians
+    bool                 success           = false;
+    std::array<double,7> joint_states      = {}; 
+    double               position_error    = std::numeric_limits<double>::quiet_NaN();
+    double               orientation_error = std::numeric_limits<double>::quiet_NaN();
 };
 
 class KinovaKinematics{
@@ -85,6 +85,11 @@ class KinovaKinematics{
          *                   rows 0-2 linear [m/s], rows 3-5 angular [rad/s].
          * @param lambda     Damping factor, must be > 0. Peak joint amplification
          *                   is 1/(2λ), reached when a singular value σ equals λ.
+         *                   λ is therefore a threshold on σ, and the σ spectrum
+         *                   depends on the arm's geometry — λ must be re-tuned
+         *                   per robot (design.md §5.4.1). It lives in the adapter,
+         *                   below the interface contract, so a per-robot λ does
+         *                   not weaken the portability claim.
          * @return DlsResult; check ok before using q_dot_rad.
          */
         DlsResult jointVelocityDLS(const std::array<double,7>& q_meas_rad,
@@ -145,6 +150,17 @@ class KinovaKinematics{
                    double lambda) const;
 
         double getToolOffsetZ() const { return tool_offset_z_; }
+
+        /**
+         * @brief Yoshikawa manipulability index w = sqrt(det(J·Jᵀ)) — a singularity
+         *        MONITOR. Not an observation element, not a policy input. Separate
+         *        from DlsResult::manipulability, which stays NaN by D-20 (P22).
+         * @param J 6x7 Jacobian at the measured config [m/rad; rad/rad].
+         * @return w >= 0. w == 0.0 means "exactly singular" (a real value).
+         *         Returns NaN when J is non-finite ("could not compute" — distinct
+         *         from 0.0 so the loop never confuses the two).
+         */
+        double manipulability(const Eigen::Matrix<double,6,7>& J) const;
 
 
     private:

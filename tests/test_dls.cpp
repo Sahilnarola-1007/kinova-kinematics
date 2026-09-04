@@ -455,3 +455,59 @@ TEST(DlsJointVelocity, RespectsTheAmplificationCeilingAcrossConfigurations)
                   << "  |qdot| = " << r.qdot.norm() << " rad/s\n";
     }
 }
+
+// --- manipulability() monitor: known value, singular, non-finite ---
+// Instance is just a vehicle — manipulability() takes J directly and never
+// touches the DH table, so a default-constructed object is fine.
+
+TEST(Manipulability, DiagonalJacobianKnownValue)
+{
+    KinovaKinematics kin;
+
+    // J = [diag(1,2,3,4,5,6) | 0]  ->  J·Jᵀ = diag(1,4,9,16,25,36)
+    // det = 518400,  w = sqrt(518400) = 720  (= 1·2·3·4·5·6), hand-computable.
+    Eigen::Matrix<double,6,7> J = Eigen::Matrix<double,6,7>::Zero();
+    for (int i = 0; i < 6; ++i)
+        J(i, i) = static_cast<double>(i + 1);
+
+    const double w = kin.manipulability(J);
+
+    // Exact-representable integers through det; sqrt of a perfect square.
+    // 1e-9 is ~1e-12 relative at w=720 — orders above double epsilon.
+    EXPECT_NEAR(w, 720.0, 1e-9);
+}
+
+TEST(Manipulability, RankDeficientJacobianIsZero)
+{
+    KinovaKinematics kin;
+
+    // Same J, row zeroed -> rank 5 -> one singular value 0 -> det = 0.
+    // w == 0.0 is a REAL value ("exactly singular"), distinct from the NaN
+    // "could-not-compute" case below.
+    Eigen::Matrix<double,6,7> J = Eigen::Matrix<double,6,7>::Zero();
+    for (int i = 0; i < 6; ++i)
+        J(i, i) = static_cast<double>(i + 1);
+    J.row(2).setZero();
+
+    const double w = kin.manipulability(J);
+
+    // A zero column drives det to exactly 0; floor-at-0 guard pins any noise.
+    EXPECT_NEAR(w, 0.0, 1e-12);
+}
+
+TEST(Manipulability, NonFiniteJacobianReturnsNaN)
+{
+    KinovaKinematics kin;
+
+    // Dropped BaseCyclic frame -> NaN in q -> NaN in J. Must return the
+    // "could-not-compute" signal (NaN), NEVER 0.0 ("singular"). isnan, not NEAR:
+    // NaN != NaN, so EXPECT_NEAR would always fail.
+    Eigen::Matrix<double,6,7> J = Eigen::Matrix<double,6,7>::Zero();
+    for (int i = 0; i < 6; ++i)
+        J(i, i) = static_cast<double>(i + 1);
+    J(0, 0) = std::numeric_limits<double>::quiet_NaN();
+
+    const double w = kin.manipulability(J);
+
+    EXPECT_TRUE(std::isnan(w));
+}

@@ -4,6 +4,7 @@
 #include<eigen3/Eigen/Dense>
 #include<cmath>
 #include<array>
+#include<limits>
 
 using Eigen::Matrix4d;
 using Eigen::Matrix3d;
@@ -32,7 +33,8 @@ KinovaKinematics::KinovaKinematics(double tool_offset_z):
             {PI,   0.0, -0.1674, PI}
             }},
             joint_min_{-2*PI,-2.2497,-2*PI,-2.5795,-2*PI,-2.0996311,-2*PI},
-            joint_max_{2*PI,2.2497,2*PI,2.5795,2*PI,2.0996311,2*PI}
+            joint_max_{2*PI,2.2497,2*PI,2.5795,2*PI,2.0996311,2*PI},
+            tool_offset_z_{tool_offset_z}
             {}
 
 Matrix4d KinovaKinematics::dhTransform(double alpha, double a,
@@ -57,8 +59,8 @@ Matrix4d KinovaKinematics::computeFK(const std::array<double, 7> &joint_angles) 
 
     Matrix4d T, Temp;
     double theta;
-
-        T_tool(2, 3) = tool_offset_z_;  // tool offset from ctor param, local z-axis
+    Eigen::Matrix4d T_tool = Eigen::Matrix4d::Identity(); // tool offset from ctor param, local z-axis
+      
 
     // Row 0: base frame transform (no joint angle)
     T = dhTransform(dh_params_[0].alpha, dh_params_[0].a,
@@ -74,12 +76,10 @@ Matrix4d KinovaKinematics::computeFK(const std::array<double, 7> &joint_angles) 
                            dh_params_[i].d, theta);
         T = T * Temp;
     }
-
-    Eigen::Matrix4d T_tool = Eigen::Matrix4d::Identity();
     
     // distance from tool frame origin to tip of the tool, 
     //the point we calculate FK w.r.t 
-    T_tool(2, 3) = 0.113;  // tool offset along local z-axis
+    T_tool(2, 3) = tool_offset_z_;  // tool offset along local z-axis
     T = T * T_tool;
     return T;
     
@@ -223,6 +223,26 @@ DlsResult KinovaKinematics::jointVelocityDLS(
     return solveDLS(J, twist_des, lambda);
 
 }
+
+double KinovaKinematics::manipulability(const Eigen::Matrix<double,6,7>& J) const
+        {
+            // Non-finite J = a dropped/partial BaseCyclic frame pushed NaN into q and
+            // it propagated through computeJacobian. Return the "could not compute"
+            // signal (NaN), never 0.0 which already means "exactly singular".
+            
+            if (!J.allFinite())
+                return std::numeric_limits<double>::quiet_NaN();
+
+            // A = J·Jᵀ, 6x6 symmetric PSD. Fixed size -> stack, no heap. noalias()
+            // suppresses the product temporary.
+            Eigen::Matrix<double,6,6> A;
+            A.noalias() = J * J.transpose();
+
+            // det(A) >= 0 mathematically; near singular, rounding can make the COMPUTED
+            // det a tiny negative. Floor at 0 before sqrt (see the abs-vs-floor note).
+            const double det = A.determinant();
+            return std::sqrt(det < 0.0 ? 0.0 : det);
+        }
 
 IKResult KinovaKinematics::solveIK(
             const Eigen::Matrix4d& target_pose,
