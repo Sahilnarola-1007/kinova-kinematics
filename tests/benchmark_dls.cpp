@@ -1,28 +1,18 @@
 /**
  * @file benchmark_dls.cpp
- * @brief Latency benchmark for KinovaKinematics::jointVelocityDLS on the 1 kHz path.
- *        Times the full loop-path call (internal computeJacobian + solveDLS),
- *        reports mean and tail percentiles over N iterations, and writes every
- *        per-iteration sample to CSV.
- * @author Sahil (ABL) — Phase 0, Step 6.2 (differential IK latency)
+ * @brief Per-call latency of KinovaKinematics::jointVelocityDLS (computeJacobian +
+ *        solveDLS) on the 1 kHz path. Reports mean and tail percentiles over N calls,
+ *        writes every sample to CSV. ACTION side, below the contract. Step 6.2.
+ * @author Sahil (ABL)
  *
- * Layer: below the contract (differential IK). Action/command side.
- * Run pinned + real-time (host scheduling owned by the invocation, not this file):
+ * Protocol (scheduling is owned by the invocation, not this file):
  *   chrt -f 80 taskset -c 2 ./benchmark_dls dls_latency.csv
+ * Build type is part of the number: RelWithDebInfo (-O2 -g -DNDEBUG); Eigen's expression
+ * templates only collapse under inlining. Results and protocol: design.md §8.2.
  *
- * Method notes:
- *  - steady_clock (monotonic) is the correct choice for interval measurement.
- *    The project rule "use cycle-count time, not steady_clock" is for COMMAND
- *    generation (smooth setpoints under jitter); a benchmark measures elapsed
- *    time, so it must read a real monotonic clock. Different job.
- *  - doNotOptimize()/clobber() defeat dead-code elimination and loop-invariant
- *    hoisting so the compiler cannot compute the solve once and reuse it.
- *  - Per-iteration timestamps (not batch timing) are required: batch timing
- *    yields only a mean and destroys the tail distribution p99.9 needs.
- *  - The empty-loop floor (back-to-back clock reads) is measured and printed so
- *    a sub-microsecond result stays honest about clock read overhead.
- *  - A tight p99.9-vs-mean gap is the evidence that the fixed-size Eigen path
- *    does not allocate on the hot path (the reason D-21 fixed the Jacobian size).
+ * Method: steady_clock is correct for an elapsed interval (the cycle-anchor rule is for
+ * COMMAND generation); doNotOptimize/clobber defeat hoisting; per-iteration samples keep
+ * the tail (batch timing destroys p99.9); the clock floor is measured and printed.
  */
 
 #include <kinova_kinematics/KinovaKinematics.hpp>  
@@ -40,29 +30,22 @@
 
 namespace {
 
-// --- Benchmark configuration (knobs you own) --------------------------------
-// p99.9 over 1e4 is only the 10th-worst sample; 1e6 gives a stable tail and
-// still runs in a few seconds of CPU. Warmup covers cold cache / page faults.
+// p99.9 over 1e4 is the 10th-worst sample; 1e6 gives a stable tail in seconds [DESIGN].
 constexpr std::size_t kIterations = 1'000'000;
 constexpr std::size_t kWarmup     =    10'000;
 
-// [UNVERIFIED] Arbitrary NON-SINGULAR configuration (rad). Replace with your
-// measured home config if you want a pose-specific number — but timing is
-// essentially config-independent here: the numerical Jacobian does the same
-// fixed count of computeFK evaluations and solveDLS runs a fixed-size solve,
-// regardless of the joint values (checked by comparing to another config).
+// Arbitrary configuration [rad], believed non-singular [UNVERIFIED — SVD would check].
+// Timing is config-independent: fixed FK count, fixed-size solve, no data-dependent
+// branch [MEASURED by comparing against a second config, run not recorded].
 constexpr std::array<double, 7> kQFixedRad = {0.10, 0.40, 0.00, 1.30, 0.00, 0.90, 0.50};
 
-// Representative small twist, BASE frame: rows 0-2 linear [m/s], 3-5 angular [rad/s].
-// Value does not affect compute time (no data-dependent branching in the solve).
+// BASE-frame twist, rows 0-2 [m/s], 3-5 [rad/s]. Value does not affect timing.
 const Eigen::Matrix<double, 6, 1> kTwistDes =
     (Eigen::Matrix<double, 6, 1>() << 0.05, 0.0, 0.0, 0.0, 0.0, 0.0).finished();
 
-constexpr double kLambda = 0.05;  // damping; does not affect latency
+constexpr double kLambda = 0.05;  // provisional [DESIGN]; does not affect latency
 
-// --- Optimizer barriers (GCC/Clang) -----------------------------------------
-// Force `value` to be treated as read/written so the surrounding computation
-// cannot be elided or hoisted out of the timed loop.
+// Optimizer barriers (GCC/Clang): the timed call cannot be elided or hoisted.
 template <typename T>
 inline void doNotOptimize(const T& value) {
     asm volatile("" : : "r,m"(value) : "memory");
@@ -85,7 +68,8 @@ int main(int argc, char** argv) {
 
     const KinovaKinematics kin;
 
-    // --- Measurement floor: cost of the two clock reads + barriers -----------
+    // Clock floor: two back-to-back reads + barriers. Conflicting readings exist
+    // across runs (9 vs 13 ns) — do not cite until resolved (Step 9).
     std::int64_t floor_min_ns = std::numeric_limits<std::int64_t>::max();
     for (std::size_t i = 0; i < 100'000; ++i) {
         const auto t0 = clock::now();
@@ -96,7 +80,7 @@ int main(int argc, char** argv) {
         floor_min_ns = std::min<std::int64_t>(floor_min_ns, ns);
     }
 
-    // --- Warmup (not recorded) ----------------------------------------------
+    // Warmup (not recorded): cold cache, page faults.
     double sink = 0.0;
     for (std::size_t i = 0; i < kWarmup; ++i) {
         doNotOptimize(kQFixedRad);
@@ -105,9 +89,9 @@ int main(int argc, char** argv) {
         doNotOptimize(sink);
     }
 
-    // --- Timed run: per-iteration latency -----------------------------------
+    // Timed run, per-iteration samples.
     std::vector<std::int64_t> samples_ns;
-    samples_ns.reserve(kIterations);  // pre-allocate: no growth during timing
+    samples_ns.reserve(kIterations);  // no growth during timing
 
     for (std::size_t i = 0; i < kIterations; ++i) {
         doNotOptimize(kQFixedRad);
@@ -120,7 +104,7 @@ int main(int argc, char** argv) {
             std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
     }
 
-    // --- Stats ---------------------------------------------------------------
+    // Stats
     long double sum = 0.0L;
     for (const auto v : samples_ns) sum += static_cast<long double>(v);
     const double mean_ns = static_cast<double>(sum / static_cast<long double>(kIterations));
@@ -139,7 +123,7 @@ int main(int argc, char** argv) {
               << "  max               : " << sorted.back()         << " ns\n"
               << "  budget            : 1'000'000 ns (1 kHz cycle)\n";
 
-    // --- CSV out (RAII stream) ----------------------------------------------
+    // CSV out
     std::ofstream csv(out_path);
     if (!csv) {
         std::cerr << "error: cannot open " << out_path << " for writing\n";
@@ -151,7 +135,7 @@ int main(int argc, char** argv) {
     }
     csv.close();
 
-    // Consume sink so it cannot be optimized away.
+    // Consume sink.
     if (std::isnan(sink)) std::cerr << "unreachable\n";
     std::cout << "  wrote             : " << out_path << '\n';
     return 0;

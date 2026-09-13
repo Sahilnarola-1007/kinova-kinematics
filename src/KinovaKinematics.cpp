@@ -11,16 +11,24 @@ using Eigen::Matrix3d;
 using Eigen::Vector3d;
 
 
+// ── KinovaKinematics ─────────────────────────────────────────────────────────
+// Layer:   Below the contract (adapter), 1 kHz path
+// Side:    OBS computeFK; ACTION computeJacobian / solveDLS / jointVelocityDLS
+// In/Out:  see KinovaKinematics.hpp header block
+// Fails:   non-finite input → ok=false, q̇ = 0; near-singular → damped, never refused here
+// Ref:     design.md §5, §6
+// ─────────────────────────────────────────────────────────────────────────────
+
 namespace {
-    // Local to this translation unit — no header pollution, no M_PI dependency
-    // (M_PI is POSIX, not ISO C++, and -Wpedantic is on).
+    // Local to this translation unit: M_PI is POSIX, not ISO C++, and -Wpedantic is on.
     constexpr double PI       = 3.14159265358979323846;
     constexpr double kDegToRad = PI / 180.0;
     constexpr double kRadToDeg = 180.0 / PI;
     }  // namespace
 
-//constexpr double PI = 3.141592653589793;  // file-scope constant, not exposed in header
-
+// DH link lengths [SPEC] Kinova Gen3 kinematic parameters (record the User Guide ref).
+// joint_min_/max_: [SPEC] User Guide Table 39 for joints 2/4/6; ±2π sentinels for the
+// continuous joints — D-27: differs from SafetyFilter.hpp in value and sentinel.
 KinovaKinematics::KinovaKinematics(double tool_offset_z):
     dh_params_{
             {{PI,   0.0,  0.0,    0.0},
@@ -32,8 +40,8 @@ KinovaKinematics::KinovaKinematics(double tool_offset_z):
             {PI/2, 0.0,  0.0,    PI},
             {PI,   0.0, -0.1674, PI}
             }},
-            joint_min_{-2*PI,-2.2497,-2*PI,-2.5795,-2*PI,-2.0996311,-2*PI},
-            joint_max_{2*PI,2.2497,2*PI,2.5795,2*PI,2.0996311,2*PI},
+            joint_min_{-1e9, -2.2515, -1e9, -2.5800, -1e9, -2.0996, -1e9},
+            joint_max_{1e9,  2.2515,  1e9,  2.5800,  1e9,  2.0996,  1e9},
             tool_offset_z_{tool_offset_z}
             {}
 
@@ -59,27 +67,25 @@ Matrix4d KinovaKinematics::computeFK(const std::array<double, 7> &joint_angles) 
 
     Matrix4d T, Temp;
     double theta;
-    Eigen::Matrix4d T_tool = Eigen::Matrix4d::Identity(); // tool offset from ctor param, local z-axis
+    Eigen::Matrix4d T_tool = Eigen::Matrix4d::Identity(); // tool offset, final frame's local z
       
 
-    // Row 0: base frame transform (no joint angle)
+    // Row 0: fixed base frame, no joint angle
     T = dhTransform(dh_params_[0].alpha, dh_params_[0].a,
                     dh_params_[0].d, dh_params_[0].theta_offset);
 
     for(int i=1; i<NUM_FRAMES; i++)
     {
-        // θ(i) for row 1-7: joint angle + DH offset
+        // Rows 1-7: joint angle + DH offset [rad]
         theta = joint_angles[i-1] + dh_params_[i].theta_offset;
 
-        // DH transformation matrix for frame i
         Temp = dhTransform(dh_params_[i].alpha, dh_params_[i].a,
                            dh_params_[i].d, theta);
         T = T * Temp;
     }
     
-    // distance from tool frame origin to tip of the tool, 
-    //the point we calculate FK w.r.t 
-    T_tool(2, 3) = tool_offset_z_;  // tool offset along local z-axis
+    // Flange → tip along local z (D-14). FK is reported at the tip.
+    T_tool(2, 3) = tool_offset_z_;
     T = T * T_tool;
     return T;
     
@@ -97,9 +103,10 @@ Matrix3d KinovaKinematics::getRotation(const Matrix4d &transform) const{
 
 Eigen::Matrix<double,6,7> KinovaKinematics::computeJacobian(const std::array<double,7> &joint_angles) const{
 
-    Eigen::Matrix<double,6,7> J = Eigen::Matrix<double,6,7>::Zero();  // 6x7 Jacobian, initialized to zero
+    Eigen::Matrix<double,6,7> J = Eigen::Matrix<double,6,7>::Zero();
 
-    // Finite difference step — small enough for accuracy, large enough for float precision
+    // Forward-difference step [rad]. [DESIGN] 1e-6: conventional middle between
+    // truncation (too large) and cancellation (too small); not swept.
     constexpr double eps = 1e-6;
 
     std::array<double,7> perturbed_joint_angles;
@@ -107,7 +114,7 @@ Eigen::Matrix<double,6,7> KinovaKinematics::computeJacobian(const std::array<dou
     Matrix3d T0_angular, T1_angular, R_delta;
     Vector3d w, p0, p1;
 
-    // Compute FK at current config — used as baseline for all columns
+    // Baseline pose; each column perturbs one joint against it.
     T0 = computeFK(joint_angles);
     T0_angular = T0.block<3,3>(0,0);
     p0 = T0.block<3,1>(0,3);
@@ -115,22 +122,19 @@ Eigen::Matrix<double,6,7> KinovaKinematics::computeJacobian(const std::array<dou
     for(int i=0; i<NUM_JOINTS; i++){
 
         perturbed_joint_angles = joint_angles;
-
-        // Perturb only joint i by eps — all other joints unchanged
         perturbed_joint_angles[i] = joint_angles[i] + eps;
 
-        // FK after perturbation
         T1 = computeFK(perturbed_joint_angles);
         T1_angular = T1.block<3,3>(0,0);
         p1 = T1.block<3,1>(0,3);
 
-        // R_delta: rotation from T0 to T1 (R2 * R1t)
+        // Small rotation from T0 to T1, expressed in BASE: R1·R0ᵀ ≈ I + eps·[w]×
         R_delta = T1_angular * T0_angular.transpose();
 
-        // Linear part: rate of EE position change (m/rad)
+        // Linear rows [m/rad], BASE frame
         J.block<3,1>(0,i) = (p1 - p0) / eps;
 
-        // Angular part: axis-angle rate via skew-symmetric extraction (rad/rad)
+        // Angular rows [dimensionless]: vee of the skew part, divided by 2·eps
         w << (R_delta(2,1) - R_delta(1,2)) / (2*eps),
              (R_delta(0,2) - R_delta(2,0)) / (2*eps),
              (R_delta(1,0) - R_delta(0,1)) / (2*eps);
@@ -146,40 +150,30 @@ DlsResult KinovaKinematics::solveDLS(const Eigen::Matrix<double,6,7>& J,
                                 double lambda) const
 {
 
-    //constructing the output struct with default values
-    DlsResult out;
-    // Guard: lambda must be strictly positive.
-    //
-    // With lambda > 0, A is provably symmetric positive definite for EVERY
-    // configuration:  xᵀAx = ‖Jᵀx‖² + λ²‖x‖² ≥ λ²‖x‖² > 0.  Singularity makes A
-    // ill-CONDITIONED, never indefinite. With lambda == 0, A = J·Jᵀ is only
-    // positive SEMI-definite and is genuinely rank-deficient at a singularity —
-    // which is the one case the factorisation cannot survive. So this test is
-    // not guarding the geometry, it is guarding against a config typo.
-    //
-    // checks lambda, must be > 0 and finite
+    DlsResult out;   // default: q̇ = 0, ok = false — every early return holds the arm
+
+    // λ > 0 makes A = JJᵀ + λ²I symmetric positive definite at EVERY configuration
+    // (xᵀAx = ‖Jᵀx‖² + λ²‖x‖² > 0): singularity only ill-conditions A. λ = 0 leaves
+    // A semi-definite and rank-deficient at a singularity — the one case LDLᵀ cannot
+    // survive. This guard catches a config typo, not geometry. inf passes λ > 0 and
+    // is caught only by isfinite.
     if (!(lambda > 0.0) || !std::isfinite(lambda)) 
         return out;
 
-    // Guard: finite inputs. A dropped or partially-parsed BaseCyclic frame puts
-    // NaN into q_meas, and NaN propagates silently all the way to the wire.
-    // Checking ldlt.info() alone is NOT sufficient — it reports on the
-    // factorisation, and whether Eigen flags a NaN-filled matrix is UNVERIFIED.
-    // Hence explicit finiteness checks on both ends. (Unit test: DlsRejectsNan.)
+    // A dropped/partial BaseCyclic frame puts NaN in q and it reaches the wire silently.
+    // Whether Eigen's ldlt.info() flags a NaN-filled matrix is [UNVERIFIED], so
+    // finiteness is checked explicitly on both ends. (test_dls.cpp guards.)
     if (!J.allFinite() || !twist_des.allFinite()) 
         return out;
 
-    // A = J·Jᵀ + λ²·I₆   — 6x6, fixed size, stack-allocated, no heap in the
-    // 1 kHz path. noalias() suppresses the temporary Eigen would otherwise
-    // create for the product.
+    // 6x6 fixed size → stack, no heap on the 1 kHz path; noalias() suppresses the
+    // product temporary. design.md §5.3.5.
     Eigen::Matrix<double,6,6> A;
     A.noalias() = J * J.transpose();
     A.diagonal().array() += lambda * lambda;
 
-    // LDLᵀ rather than an explicit inverse: backward-stable,
-    // and the pivot diagonal D is a free conditioning indicator for later.
-    // Solving the 6x6 system is why this is cheap — the 7x6 damped pseudoinverse
-    // is never formed.
+    // LDLᵀ, never an explicit inverse: backward-stable, pivot diagonal is a free
+    // conditioning indicator, and the 7x6 damped pseudoinverse is never formed.
     const Eigen::LDLT<Eigen::Matrix<double,6,6>> ldlt(A);
     if (ldlt.info() != Eigen::Success) 
         return out;
@@ -191,8 +185,7 @@ DlsResult KinovaKinematics::solveDLS(const Eigen::Matrix<double,6,7>& J,
     out.lambda_used = lambda;
     out.qdot.noalias() = J.transpose() * y;   // [rad/s], 7x1
 
-    //calculating twst_achieved = J*qdot
-    out.twist_achieved.noalias() = J * out.qdot;
+    out.twist_achieved.noalias() = J * out.qdot;   // BASE [m/s; rad/s]; residual = damping
     
     out.ok = true;
     return out;
@@ -203,21 +196,17 @@ DlsResult KinovaKinematics::jointVelocityDLS(
         const Eigen::Matrix<double,6,1>& twist_des,
         double lambda) const
 {
-    // Default-constructed: q_dot all zeros, ok == false. Every early return
-    // below therefore commands zero joint motion, not stale or partial values.
-    DlsResult result;
+    DlsResult result;   // default: q̇ = 0, ok = false
 
-    // the DH table and Jacobian are defined on radians.
-    
+    // Reject a non-finite joint angle before it contaminates all 42 Jacobian entries.
     for (int i = 0; i < NUM_JOINTS; ++i) {
         if (!std::isfinite(q_meas_rad[i])) 
-            return result;   // reject before it spreads
+            return result;
     }
 
-    // Jacobian at the MEASURED configuration. Rows 0-2 are m/rad, rows 3-5 are
-    // dimensionless — the mixed units are why a single scalar lambda is not
-    // dimensionally consistent across all six rows. Acknowledged in design.md;
-    // it is a known and accepted approximation, not an oversight.
+    // J at the MEASURED q (the servo lags the command, so q_send describes a pose
+    // the arm is not in). Mixed row units are why one scalar λ is dimensionally
+    // inconsistent — known, accepted for v1, design.md §5.3.3.
     const Eigen::Matrix<double,6,7> J = computeJacobian(q_meas_rad);
 
     return solveDLS(J, twist_des, lambda);
@@ -226,20 +215,17 @@ DlsResult KinovaKinematics::jointVelocityDLS(
 
 double KinovaKinematics::manipulability(const Eigen::Matrix<double,6,7>& J) const
         {
-            // Non-finite J = a dropped/partial BaseCyclic frame pushed NaN into q and
-            // it propagated through computeJacobian. Return the "could not compute"
-            // signal (NaN), never 0.0 which already means "exactly singular".
-            
+            // NaN = "could not compute" (non-finite J from a bad frame). Never 0.0,
+            // which is a real value meaning "exactly singular".
             if (!J.allFinite())
                 return std::numeric_limits<double>::quiet_NaN();
 
-            // A = J·Jᵀ, 6x6 symmetric PSD. Fixed size -> stack, no heap. noalias()
-            // suppresses the product temporary.
-            Eigen::Matrix<double,6,6> A;
+            Eigen::Matrix<double,6,6> A;   // 6x6 symmetric PSD, stack, no heap
             A.noalias() = J * J.transpose();
 
-            // det(A) >= 0 mathematically; near singular, rounding can make the COMPUTED
-            // det a tiny negative. Floor at 0 before sqrt (see the abs-vs-floor note).
+            // det ≥ 0 mathematically; rounding near singularity can give a tiny
+            // negative. Floor at 0 (not abs: abs would turn -1e-18 into a false
+            // "slightly non-singular").
             const double det = A.determinant();
             return std::sqrt(det < 0.0 ? 0.0 : det);
         }
@@ -251,86 +237,78 @@ IKResult KinovaKinematics::solveIK(
             double position_tol,
             double orientation_tol) const{
 
-    // Reject non-positive iteration counts up front: the loop would never run,
-    // leaving the error terms undefined. -1.0 norms signal "did not run".
+    // Non-positive iteration count: loop would never run and dx/dw would be
+    // uninitialised. -1.0 norms signal "did not run".
     if (max_iterations <= 0) {
         return {false, initial_guess, -1.0, -1.0};
     }
 
-    //double lambda = 0.5;  // damping factor — prevents dq explosion near singularities
-    double alpha=0.5;      //gain
+    double alpha=0.5;      // null-space gain [DESIGN]
     std::array<double,7> joint_angles = initial_guess;
 
+    // Dynamic-size Eigen and an explicit inverse below are acceptable ONLY because
+    // this solver is offline (design.md §5.5). Never call it from the 1 kHz loop.
     Matrix4d current_pose;
-    Matrix3d R_current, R_target, R_delta;  // rotation matrices for orientation error
-    Vector3d dx,dw ;  // position and orientation error vectors
-    Vector3d P_current, P_target;  // position vectors of current and target
+    Matrix3d R_current, R_target, R_delta;
+    Vector3d dx,dw ;  // position error [m], orientation error [rad], BASE frame
+    Vector3d P_current, P_target;
     Eigen::VectorXd dq(7),z0(7);
-    Eigen::VectorXd de = Eigen::VectorXd::Zero(6);;                                      // stacked error: [dp; dw] (6x1)
+    Eigen::VectorXd de = Eigen::VectorXd::Zero(6);;                                      // stacked [dx; dw]
     Eigen::MatrixXd A = Eigen::MatrixXd::Zero(6, 6);
     Eigen::MatrixXd N = Eigen::MatrixXd::Zero(7, 7);
-    Eigen::MatrixXd I_7 = Eigen::MatrixXd::Identity(7, 7);       // null space projector identity
+    Eigen::MatrixXd I_7 = Eigen::MatrixXd::Identity(7, 7);
     Eigen::MatrixXd J = Eigen::MatrixXd::Zero(6, 7);
     Eigen::MatrixXd J_pinv = Eigen::MatrixXd::Zero(7,6);
-    Eigen::MatrixXd I_6 = Eigen::MatrixXd::Identity(6, 6);       // damping identity matrix
+    Eigen::MatrixXd I_6 = Eigen::MatrixXd::Identity(6, 6);
 
     int i = 0;
     while(i < max_iterations){
 
-        // Step 1: compute FK at current joint config
         current_pose = computeFK(joint_angles);
 
-        // Step 2: compute position error dp (3x1, meters)
         P_target  = target_pose.block<3,1>(0,3);
         P_current = current_pose.block<3,1>(0,3);
         dx = P_target - P_current;
 
-        // Step 3: compute orientation error dw via skew-symmetric extraction (3x1, radians)
+        // Orientation error: vee of the skew part of R_target·R_currentᵀ (small-angle)
         R_target  = target_pose.block<3,3>(0,0);
         R_current = current_pose.block<3,3>(0,0);
-        R_delta   = R_target * R_current.transpose();  // R2 * R1t
+        R_delta   = R_target * R_current.transpose();
 
         dw << (R_delta(2,1) - R_delta(1,2)) / 2,
               (R_delta(0,2) - R_delta(2,0)) / 2,
               (R_delta(1,0) - R_delta(0,1)) / 2;
 
-        // Step 4: check convergence
         if(dx.norm() < position_tol && dw.norm() < orientation_tol){
             return {true, joint_angles, dx.norm(), dw.norm()};
         }
 
-        // Step 5: recompute Jacobian at current q (must update every iteration)
-        J = computeJacobian(joint_angles);
+        J = computeJacobian(joint_angles);   // must be re-evaluated every iterate
 
-        // Step 6: stack full 6x1 error vector
-        de.block<3,1>(0,0) = dx;  // position error (rows 0-2)
-        de.block<3,1>(3,0) = dw;  // orientation error (rows 3-5)
+        de.block<3,1>(0,0) = dx;
+        de.block<3,1>(3,0) = dw;
 
+        // Error-proportional damping [DESIGN]: only meaningful when there IS a pose
+        // error — never carry this heuristic into the differential solve.
         double lambda = 0.5 * de.norm() + 1e-4;
 
-        // Step 7: damped least squares — dq = Jt * (J*Jt + lambda^2 * I)^-1 * de
+        // dq = Jᵀ (JJᵀ + λ²I)⁻¹ de  — explicit inverse tolerated offline only
         A  = J * J.transpose();
         A  = A + (lambda * lambda) * I_6;
-        J_pinv = J.transpose()*A.inverse(); //damped pseudoinverse 
-        dq = J_pinv* de; //7x1
+        J_pinv = J.transpose()*A.inverse();
+        dq = J_pinv* de;
 
-        //Step 8: Null-space projector
+        // Null-space joint-centring: (I − J⁺J) z0 does not move the end-effector
         N = I_7 - J_pinv * J;
-
-        //Step 9:Secondary gradient
-        z0=jointLimitGradient(joint_angles);  //7x1
-        
-        // Step 10: add null-space term
+        z0=jointLimitGradient(joint_angles);
         dq = dq + alpha * N * z0;
         
-        // Step 11: update joint angles with Null space
         for(int j=0; j<NUM_JOINTS; j++){
             joint_angles[j] = joint_angles[j] + dq(j);
         }
         i++;
     }
 
-    // Max iterations reached without convergence
     std::cerr << "[solveIK] Warning: did not converge after " << max_iterations
               << " iterations. pos_err=" << dx.norm()
               << "m  ori_err=" << dw.norm() << "rad\n";
@@ -340,7 +318,8 @@ IKResult KinovaKinematics::solveIK(
 
 Eigen::VectorXd KinovaKinematics::jointLimitGradient(const std::array<double,7> & joint_angles) const{
 
-    //z0 = 7x1 vector, null space gradient that pushes each joint angle towards its center
+    // Gradient toward the centre of each joint range, scaled by 1/range² so
+    // narrow joints are pushed harder. Uses joint_min_/max_ (D-27 duplicate).
     Eigen::VectorXd z0(7);
     double q_mid{};
 

@@ -1,24 +1,26 @@
-# SafetyFilter — Design Document
+# safety_filter.md — SafetyFilter (kinova_kinematics)
 
-Three-site safety filter for the force-conditioned manipulation adapter.
-Sits **below the contract** on the 1 kHz path, between the frozen policy's action
-output and the commanded joint positions sent to the arm.
+Three-site safety filter for the Idea 5 adapter. **Layer: below the contract**, 1 kHz path,
+ACTION side — between the frozen policy's action output and the commanded joint positions.
+Part of `kinova_kinematics`; summarised in `design.md` §5.6.
 
-**Decision**: engineered clipping is the documented default.
-A control barrier function (CBF) is future work — a swap behind the same interface,
-not a retrain. See `design_decisions.md`.
+**Decision (D-07) `[DESIGN]`:** engineered clipping with logged interventions. A formal barrier
+certificate (control barrier function) is future work — a swap behind the same interface, not a
+retrain. See `design_decisions.md`.
+
+Provenance tags: `[MEASURED]` lab PC / hardware, run identified · `[SPEC]` vendor document ·
+`[DESIGN]` project decision · `[UNVERIFIED]` not checked, with what would check it.
 
 ---
 
 ## In one paragraph
 
 The policy emits an action. Nothing guarantees that action is safe for *this* arm — the
-policy is frozen, robot-agnostic, and knows nothing about Kinova's joint limits or the
-table edge. The SafetyFilter is the component that makes the action executable on real
+policy is frozen and knows nothing about this arm's joint limits or the table edge. The SafetyFilter is the component that makes the action executable on real
 hardware, and it does so at three points in the pipeline where a different kind of
 quantity is available to check: the raw force command, the assembled Cartesian twist, and
-the resulting joint rates. It costs **under 40 ns per cycle**, or 0.004 % of the 1 kHz
-budget, so its cost is never an argument against making it stricter.
+the resulting joint rates. Its worst measured p99.9 is **≤ 40 ns per cycle** `[MEASURED, §Verification]`, 0.004 % of the
+1 kHz budget, so its cost is never an argument against making it stricter.
 
 Two things it deliberately does **not** do: it never touches `vz` as a magnitude bound
 (the admittance reflex owns the normal axis), and it never feeds its own output back to
@@ -139,7 +141,8 @@ If Site 2 included `vz` in the `|v|` norm, a large reflex output would push the 
 `v_tan_max` and trigger scaling on `[vx, vy]` — throttling the tangential search to fix a
 normal-axis value the filter doesn't own. Worse, the reflex's PI would chase an
 unreachable force target (the filter silently reduces its commanded velocity), the
-integrator would ramp to the clamp (~4 s under sustained error, measured), and the
+integrator would ramp to the clamp (~4 s under sustained error `[MEASURED — 13 Hz wipe
+predecessor, admittance-controller; run not identified here]`), and the
 effective controller would no longer be the tuned one. Force-band numbers become
 unrepeatable.
 
@@ -148,8 +151,8 @@ analysable.** You can no longer attribute an observed force error to the reflex 
 to the filter, because both are acting and neither logs the other's contribution.
 
 The fix is structural: `vz` does not belong in a motion-control magnitude bound because
-the normal axis is force-controlled (Raibert & Craig 1981, Mason 1981 —
-**[UNVERIFIED CITATION, check before submission]**). The workspace box is the only Site 2
+the normal axis is force-controlled — the hybrid force/motion principle
+`[UNVERIFIED — Sahil must check the primary sources before citing any author]`. The workspace box is the only Site 2
 bound that touches `vz`, and it does so as a refusal (safety-of-last-resort), not a
 scaling.
 
@@ -157,7 +160,8 @@ scaling.
 
 ## Bounds table
 
-All values are parameters from `SafetyBounds`, sourced from the skill manifest.
+All values are parameters from `SafetyBounds`. They are header defaults `[DESIGN, provisional —
+D-09 open]` until the manifest mechanism lands (D-04); nothing is sourced from a manifest yet.
 
 ### Site 1 — Force
 
@@ -173,30 +177,32 @@ All values are parameters from `SafetyBounds`, sourced from the skill manifest.
 | `omega_max` | 0.50 | rad/s |
 | Workspace box | ±0.5 x, ±0.5 y, 0.05–0.70 z | m, base frame |
 
-Reference (User Guide, spherical wrist): Cartesian hard limits are 0.5 m/s linear,
-0.8727 rad/s (50°/s) angular, 40 N force, 15 N·m torque. Our defaults are within these.
+Reference `[SPEC — Kinova Gen3 User Guide, spherical wrist; Sahil to record the table number]`:
+Cartesian hard limits 0.5 m/s linear, 0.8727 rad/s (50 °/s) angular, 40 N force, 15 N·m torque.
+Our defaults are within these.
 
 ### Site 3 — Joint
 
 | Bound | Joints 1–4 | Joints 5–7 | Units | Source |
 |-------|-----------|-----------|-------|--------|
-| Velocity cap | 2.094 (120°/s) | 3.491 (200°/s) | rad/s | [SPEC] Kortex actuator spec, verified Aug 2026 |
-| Position min | −∞, −2.2515, −∞, −2.5800, −∞, −2.0996, −∞ | | rad | [SPEC] User Guide Table 39 |
-| Position max | +∞, +2.2515, +∞, +2.5800, +∞, +2.0996, +∞ | | rad | [SPEC] User Guide Table 39 |
+| Velocity cap | 2.094 (120 °/s) | 3.491 (200 °/s) | rad/s | `[SPEC]` Kortex actuator spec, Aug 2026; not confirmed by hardware test |
+| Position min | −∞, −2.2515, −∞, −2.5800, −∞, −2.0996, −∞ | | rad | `[SPEC]` Kinova Gen3 User Guide Table 39 |
+| Position max | +∞, +2.2515, +∞, +2.5800, +∞, +2.0996, +∞ | | rad | `[SPEC]` Kinova Gen3 User Guide Table 39 |
 
 Joints 1, 3, 5, 7 are continuous rotation (no position limit). In code the sentinel is
 ±1e9, not infinity, so any limit test must compare against the sentinel threshold rather
 than calling `isinf`.
 
-Note: the User Guide also lists high-level control library velocity limits
-(Table 40: 79.64°/69.91° general; Table 41: 50°/s admittance). These are
-**not applied in low-level servoing mode**, which is what we use. The actuator
-hardware caps (120°/200°) are the correct bounds for our path.
+Note `[SPEC]`: the User Guide also lists high-level control library velocity limits
+(Table 40: 79.64 °/s / 69.91 °/s general; Table 41: 50 °/s admittance). These are read as
+**not applied in low-level servoing mode** `[UNVERIFIED by test — an over-cap command in
+LOW_LEVEL_SERVOING would settle it]`, which is the mode this project uses. The actuator caps
+(120 / 200 °/s) are the bounds for our path.
 
 **Site 3 velocity scaling is load-bearing, not defensive dead code.** In tested
-mid-workspace poses, DLS output reaches ‖q̇‖ = 3.39 rad/s against the 2.094 rad/s cap on
-the limited joints. It fires in normal operation and must be included in any latency
-number.
+mid-workspace poses, DLS output reaches ‖q̇‖ = 3.39 rad/s `[COMPUTED — pose not recorded;
+record it]` against the 2.094 rad/s cap. It fires in normal operation and must be included in
+any latency number.
 
 ---
 
@@ -240,9 +246,9 @@ benchmark exercises both flavours.
 
 ## Design rules
 
-1. **Bounds are parameters, never literals.** `SafetyBounds` struct, sourced from the
-   manifest. Values tagged will be updated when the trained action distribution
-   is available.
+1. **Bounds are parameters, never literals in the algorithm.** `SafetyBounds` struct; header
+   defaults today, manifest-sourced after D-04. Values are `[DESIGN, provisional]` until the
+   trained action distribution sets them (D-09).
 
 2. **Clipped actions are not fed back to the policy.** The clip effect reaches the next
    observation via measured force and pose — that is correct and unavoidable. The clip
@@ -268,7 +274,7 @@ benchmark exercises both flavours.
 
 ## Verification
 
-### Unit tests — `test_safety_filter.cpp`, 26 GTest cases
+### Unit tests — `test_safety_filter.cpp`, 28 GTest cases
 
 Coverage: each bound in isolation, sign preservation on Site 1, `vz` exclusion from both
 Site 2 norms, inward-motion allowance at the workspace faces, uniform-scaling ratio
@@ -287,15 +293,15 @@ because the filter has data-dependent branches and therefore no single worst cas
 | `ALTERNATING` | Nominal and all-trip inputs interleaved, to defeat the branch predictor. |
 | `NON_FINITE` | NaN on even entries, +inf on odd. Times the reject path. |
 
-**Protocol.** `RelWithDebInfo` (`-O2 -g -DNDEBUG`, verified in `compile_commands.json`),
+**Protocol.** `RelWithDebInfo` (`-O2 -g -DNDEBUG`, `[MEASURED]` verified in `compile_commands.json` 4 Sep 2026),
 `chrt -f 80 taskset -c 2`, N = 1e6 per scenario, inputs cycled from a 64-entry L1-resident
 table so the compiler cannot hoist the call. Identical to the `benchmark_dls` protocol —
 which is what makes the two numbers additive. `RelWithDebInfo` rather than `Release`
 deliberately: `-g` costs zero cycles and is what makes `perf` output readable when
 profiling the composed 1 kHz loop.
 
-**Results — 4 Sep 2026. Two runs of identical code, shown as `run1 / run2` where they
-differ. All values in ns:**
+**Results `[MEASURED]` — lab PC, core 2 pinned, 4 Sep 2026. Two runs of identical code, shown
+as `run1 / run2` where they differ. All values in ns:**
 
 | Scenario | mean | batched | p50 | p99 | p99.9 | max |
 |----------|-----:|--------:|----:|----:|------:|----:|
@@ -304,7 +310,8 @@ differ. All values in ns:**
 | ALTERNATING | 25.6 | 12.6 / 12.5 | 28 / 27 | 35 / 34 | 40 / 36 | 1142 / 6851 |
 | NON_FINITE | 12.6 | 5.1 / 5.0 | 13 | 14 | 21 / 26 | 785 / 7338 |
 
-Clock floor (min of 1e5 paired reads): **9 ns**, both runs.
+Clock floor: **not cited** — readings conflict across sources (9 ns vs 13 ns); resolve at Step 9
+before any timing number is published. The bracket below holds under either value.
 
 **Reportable number: worst p99.9 across scenarios and runs ≤ 40 ns = 0.004 % of the 1 kHz
 budget.**
@@ -314,26 +321,26 @@ Reading the columns:
 - **batched** — 64 filter cycles between one pair of clock reads, so clock overhead is
   divided away. Optimistic: those 64 cycles run back to back, which the real loop never
   does.
-- **mean** — per-iteration, so no back-to-back effect, but each sample pays one ~9 ns
-  clock read the real loop never pays. Pessimistic.
-- **True single-cycle cost is bracketed between them: roughly 5–30 ns.** Report the
-  bracket, not either column alone.
+- **mean** — per-iteration, so no back-to-back effect, but each sample pays one
+  clock read (single-digit ns) the real loop never pays. Pessimistic.
+- **True single-cycle cost is bracketed between them: 5–30 ns `[MEASURED, two bounds]`.**
+  Report the bracket, never either column alone and never a point value.
 - **p50/p99/p99.9/max** come from the per-iteration run, because batching averages the
   tail away. They carry the clock read too; treat them as upper bounds.
 - Ordering is physically sensible: NON_FINITE cheapest (early reject, no arithmetic),
   NOMINAL next, ALL_TRIP most expensive (every scaling branch executes).
 
-**What this does not show.** The four scenarios are separated by 1–5 ns at a 9 ns clock
-resolution, so they are **indistinguishable in the tail** — and the worst-case label
+**What this does not show.** The four scenarios are separated by 1–5 ns at a single-digit-ns
+clock resolution, so they are **indistinguishable in the tail** — and the worst-case label
 actually moved between the two runs (ALTERNATING at 40 ns, then ALL_TRIP at 38 ns) on
 identical code. The branch-predictor hypothesis behind ALTERNATING is neither supported
 nor refuted. Claim a bound, never a ranking. The `max` column is OS events, not filter
 work: the lone outlier landed on NOMINAL in run 1 and on NON_FINITE in run 2.
 
-**Composed cost, DLS + filter:** 1878 ns + 40 ns ≈ 1.9 µs, ~0.19 % of budget. This is a
-go/no-go estimate only. The p99.9 of a sum is not the sum of the p99.9s — that treats the
-tails as perfectly correlated. The paper number must come from instrumenting the composed
-1 kHz loop end to end.
+**Composed cost, DLS + filter — `[ESTIMATE, not measured]`:** mean-sum 1.90 µs + ~0.02 µs
+≈ 1.9 µs; tail-sum 3.04 µs + 0.04 µs ≈ 3.1 µs. Go/no-go only. The p99.9 of a sum is not the
+sum of the p99.9s — that treats the tails as perfectly correlated. The reportable number comes
+from instrumenting the composed 1 kHz loop end to end (Step 8).
 
 ### Counter self-checks
 
@@ -367,12 +374,13 @@ All four scenarios pass, exit 0. What each result establishes:
 ## Limitations and future work
 
 - **Workspace box uses base-frame position but zeros task-frame velocity.** Correct
-  only when the two frames are roughly axis-aligned (true for insertion on a horizontal
+  only when the two frames are roughly axis-aligned `[DESIGN]` (insertion on a horizontal
   surface). Verify if the task frame rotates significantly from base.
 
-- **CBF:** the current implementation is engineered clipping. A CBF-based filter
-  is a swap behind the same `SafetyFilter` interface — same three call sites, same
-  result types, different math inside. This is a refactor, not a retrain.
+- **Formal barrier certificate (future work).** The current implementation is engineered
+  clipping (D-07). A barrier-function filter would be a swap behind the same `SafetyFilter`
+  interface — same three call sites, same result types, different math inside. A refactor,
+  not a retrain.
 
 - **Bound values:** genuinely blocked on the trained action distribution. The filter
   is built now with the struct; values land after training (D-09).
@@ -381,12 +389,19 @@ All four scenarios pass, exit 0. What each result establishes:
   (2.2497, 2.5795, 2.0996311) and `SafetyFilter.hpp` (2.2515, 2.5800, 2.0996). Two
   sources of truth for one physical fact. A single manifest is required.
 
-- **`pos_lookahead_dt` is misnamed.** It is a stopping horizon, not a lookahead step, and
-  should be renamed `stop_horizon_s` and set to τ. τ = 15.7 ms was measured on **joint 7
-  only** — unverified for joints 2, 4, 6, which are the joints that actually have
-  position limits.
+- **Position refusal bounds the commanded setpoint, not the measured joint.** `clipJoint`
+  checks `q_send + q̇·dt` against the limit, `dt = pos_lookahead_dt` = 1 ms `[DESIGN]`. Under
+  a first-order servo the joint is pulled toward `q_send` and settles there, so lag alone
+  cannot produce a violation — it only delays arrival. τ = 15.7 ms `[MEASURED, joint 7 only;
+  UNVERIFIED for joints 2, 4, 6]` is the lag, and a τ-sized horizon would apply only to a
+  check made against `q_meas`; applying it to a `q_send` check would refuse ~16× early for
+  no safety gain. **Open — overshoot.** If the servo overshoots its setpoint, setpoint
+  bounding is not sufficient. Not measured. Step 3 measures peak `q_meas − q_send` after a
+  step on joints 2, 4 and 6 at several speeds; that peak becomes a margin ε, refusing
+  against `limit − ε`, rather than a change of horizon. If ε = 0 the current check stands
+  unchanged and the `stop_horizon_s` rename is dropped.
 
-- **Low-level limit enforcement is unverified.** Whether the arm's own firmware refuses an
+- **Low-level limit enforcement `[UNVERIFIED]`.** Whether the arm's own firmware refuses an
   out-of-limit position command in low-level servoing mode is not established. Three
   routes: grep the SDK headers for fault codes, ask Kinova, or an empirical test on joint
   4. Until then the filter is assumed to be the only enforcement.
@@ -403,11 +418,11 @@ All four scenarios pass, exit 0. What each result establishes:
 |------|---------|
 | `SafetyFilter.hpp` | Interface — types, bounds struct, class declaration |
 | `SafetyFilter.cpp` | Implementation — three clip site methods |
-| `tests/test_safety_filter.cpp` | 26 GTest cases |
+| `tests/test_safety_filter.cpp` | 28 GTest cases |
 | `tests/benchmark_safety_filter.cpp` | Four-scenario latency benchmark with counter self-checks |
 | `safety_filter.md` | This document — architecture, rationale, bounds, results |
 
 ---
 
-*Last updated: 4 September 2026 — Phase 0 Step 6.4. Benchmark closed, counter invariants
-verified over two runs.*
+*Last updated: 11 September 2026 — documentation audit (provenance tags, clock floor withdrawn,
+test count corrected to 28). Benchmark closed 4 Sep 2026, Phase 0 Step 6.4.*

@@ -1,7 +1,8 @@
 /**
  * @file SafetyFilter.cpp
- * @brief Three-site safety filter implementation (Step 6.4).
- *        Hot-path: no allocation, no logging, no locks, no exceptions.
+ * @brief Three-site safety filter (Step 6.4). Layer: below the contract, ACTION side,
+ *        1 kHz path — no allocation, no logging, no locks, no exceptions.
+ *        Header block and frames: SafetyFilter.hpp. Rationale: safety_filter.md.
  *
  * @author Sahil Narola
  * @date   August 2026
@@ -29,8 +30,7 @@ ForceFilterResult SafetyFilter::clipForce(double f_n_desired) const
     if (!std::isfinite(f_n_desired))
     {
         result.value  = 0.0;
-        result.scale  = 0.0;   // NOTE: the value == scale * input invariant is
-                               // deliberately broken here — it cannot hold for NaN.
+        result.scale  = 0.0;   // value == scale * input cannot hold for NaN; broken on purpose
         result.reason = FilterReason::NON_FINITE_REJECTED;
         ++counter_.non_finite_rejected;
         return result;
@@ -75,7 +75,7 @@ CartesianFilterResult SafetyFilter::clipCartesian(
     result.twist = twist_task;
     int reason_idx = 0;
 
-    // Group A: tangential linear velocity [vx, vy] — vz excluded
+    // Group A: tangential [vx, vy] only — vz is reflex-owned and never scaled here
     const double vx = twist_task(0);
     const double vy = twist_task(1);
     const double v_tan_mag = std::sqrt(vx * vx + vy * vy);
@@ -107,9 +107,9 @@ CartesianFilterResult SafetyFilter::clipCartesian(
         ++counter_.omega_scaled;
     }
 
-    // Workspace box: REFUSAL — zero outward component, allow inward
-    // First checks the workspace bounds and second checks if the twist 
-    //is gonna push the end-effector outside the workspace. If so, it sets the corresponding twist component to zero.
+    // Workspace box: REFUSAL, per axis — zero the outward component, let inward pass
+    // (otherwise an arm that drifts out is trapped). Position is BASE frame, twist is
+    // TASK frame: valid only near axis alignment (safety_filter.md, Limitations).
     bool ws_hit = false;
 
     if (ee_pos_base.x() < bounds_.ws_x_min && result.twist(0) < 0.0)
@@ -122,7 +122,7 @@ CartesianFilterResult SafetyFilter::clipCartesian(
     else if (ee_pos_base.y() > bounds_.ws_y_max && result.twist(1) > 0.0)
         { result.twist(1) = 0.0; ws_hit = true; }
 
-    // Z touches vz — workspace is safety-of-last-resort for ALL axes
+    // The only place vz is touched: workspace refusal is last-resort on ALL axes
     if (ee_pos_base.z() < bounds_.ws_z_min && result.twist(2) < 0.0)
         { result.twist(2) = 0.0; ws_hit = true; }
     else if (ee_pos_base.z() > bounds_.ws_z_max && result.twist(2) > 0.0)
@@ -151,7 +151,7 @@ JointFilterResult SafetyFilter::clipJoint(
     {
         result.qdot.setZero();
         result.vel_scale        = 0.0;
-        result.pos_refused_mask = 0;   // no joint hit a limit — the input was garbage
+        result.pos_refused_mask = 0;   // no joint hit a limit — the input was garbage; keep the two distinguishable in logs
         result.reasons[0]       = FilterReason::NON_FINITE_REJECTED;
         result.num_interventions = 1;
         ++counter_.non_finite_rejected;
@@ -160,7 +160,8 @@ JointFilterResult SafetyFilter::clipJoint(
     result.qdot = qdot;
     int reason_idx = 0;
 
-    // Velocity: uniform scaling of full q̇ vector
+    // Velocity: ONE scale for the whole vector, set by the worst joint ratio.
+    // Per-joint clipping would change the joint-space direction the DLS solved for.
     double alpha = 1.0;
     for (int j = 0; j < 7; ++j)
     {
@@ -178,7 +179,8 @@ JointFilterResult SafetyFilter::clipJoint(
         ++counter_.joint_vel_scaled;
     }
 
-    // Position: refusal via single-step lookahead (runs AFTER velocity scaling)
+    // Position: refusal on the post-scaling rate. dt is a single-step lookahead;
+    // a τ-based stopping horizon is an open item (SafetyFilter.hpp).
     const double dt = bounds_.pos_lookahead_dt;
     bool pos_hit = false;
 
@@ -187,8 +189,8 @@ JointFilterResult SafetyFilter::clipJoint(
         const double v      = result.qdot(j);          // post-velocity-scaling
         const double q_next = q_send(j) + v * dt;
 
-        // Directional: refuse only motion that drives FURTHER out of bounds.
-        // Already-outside + moving inward must pass, or the joint is stuck.
+        // Directional: refuse only motion driving FURTHER out; inward must pass or a
+        // joint that overshot is stuck until a power cycle.
         const bool over_high = (q_next > bounds_.joint_pos_max[j]) && (v > 0.0);
         const bool over_low  = (q_next < bounds_.joint_pos_min[j]) && (v < 0.0);
 

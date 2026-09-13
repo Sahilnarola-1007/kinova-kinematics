@@ -1,12 +1,11 @@
 /**
  * @file test_safety_filter.cpp
- * @brief Unit tests for SafetyFilter — three clip sites + intervention counter.
- *        Mock-safe: pure computation, no Kortex, no hardware. Runs in CI.
+ * @brief Unit tests for SafetyFilter — three clip sites + InterventionCounter.
+ *        ACTION side, below the contract. Pure computation, no hardware, CI-safe.
  *
- * Assertion style: where the exact formula is an implementation choice, the test
- * pins the RELATIONSHIP (e.g. value == scale * input) rather than the formula, so
- * a legal refactor does not break the suite. Where a structural decision is being
- * guarded (vz exclusion, uniform scaling, directional refusal) the test is exact.
+ * Where a formula is an implementation choice the test pins the relationship
+ * (value == scale * input); where a structural decision is guarded (vz exclusion,
+ * uniform scaling, directional refusal) the test is exact. Rationale: safety_filter.md.
  *
  * @author Sahil Narola
  * @date   August 2026
@@ -23,15 +22,9 @@
 namespace
 {
 
-/// Absolute tolerance for all scale / velocity / force comparisons.
-///
-/// Justification: every quantity under test is O(1) in SI units. The longest
-/// numeric path is norm -> divide -> multiply, i.e. a sqrt and two rounded ops,
-/// so the true error is a few ULP of double (~1e-16 relative, ~1e-16 absolute at
-/// this magnitude). 1e-9 leaves seven orders of margin — enough to survive
-/// compiler reassociation under -O2 and FMA contraction, still eight orders
-/// tighter than the smallest physically meaningful difference in these bounds
-/// (1e-4 rad/s). A failure at 1e-9 is a logic error, never a rounding artefact.
+/// Absolute tolerance [DERIVED]: quantities are O(1) SI, longest path is
+/// sqrt + two rounded ops (~1e-16), so 1e-9 is seven orders above round-off and
+/// eight below the smallest meaningful bound difference. A failure is logic, not rounding.
 constexpr double kTol = 1e-9;
 
 using Twist6 = Eigen::Matrix<double, 6, 1>;
@@ -73,14 +66,12 @@ protected:
 
     SafetyFilter make() const { return SafetyFilter(bounds_); }
 
-    /// A point comfortably inside the default workspace box, base frame [m].
+    /// Inside the default workspace box, BASE frame [m].
     static Eigen::Vector3d insideBox() { return Eigen::Vector3d(0.0, 0.0, 0.35); }
 
-    /// NOTE (frame): clipCartesian takes a TASK-frame twist and a BASE-frame
-    /// position. Every workspace test below assumes the latched task->base
-    /// rotation is identity, which is what makes component-wise assertions on
-    /// the twist meaningful. This mirrors the known limitation recorded in
-    /// safety_filter.md; it is not a claim that the two frames are the same.
+    /// Frame note: clipCartesian takes a TASK-frame twist and a BASE-frame position.
+    /// Workspace tests assume task→base = identity so component-wise assertions
+    /// are meaningful (the known limitation in safety_filter.md, not a claim).
 };
 
 // ─── Site 1: clipForce ───────────────────────────────────────────────────────
@@ -107,8 +98,7 @@ TEST_F(SafetyFilterTest, ForceAboveBoundClampsToBound)
 
     EXPECT_NEAR(r.value, bounds_.f_n_max, kTol);
     EXPECT_LT(r.scale, 1.0);
-    // Relationship, not formula: whatever scale means, it must reproduce value.
-    EXPECT_NEAR(r.value, r.scale * f_in, kTol);
+    EXPECT_NEAR(r.value, r.scale * f_in, kTol);   // relationship, not formula
     EXPECT_EQ(r.reason, FilterReason::FORCE_SCALED);
     EXPECT_EQ(f.interventions().force_scaled, 1u);
 }
@@ -127,9 +117,7 @@ TEST_F(SafetyFilterTest, ForceClampPreservesSign)
 
 TEST_F(SafetyFilterTest, ForceExactlyAtBoundIsNotAnIntervention)
 {
-    // Clamping a value to itself changes nothing, so it is not an intervention.
-    // If this fails the .cpp uses >= instead of >. Pick one, fix the other side,
-    // and record the choice — O3 counts depend on it.
+    // Clamping a value to itself is not an intervention; O3 counts depend on > vs >=.
     SafetyFilter f = make();
 
     const ForceFilterResult r = f.clipForce(bounds_.f_n_max);
@@ -142,13 +130,8 @@ TEST_F(SafetyFilterTest, ForceExactlyAtBoundIsNotAnIntervention)
 
 TEST_F(SafetyFilterTest, ForceZeroInputDoesNotDivideByZero)
 {
-    // Fires on every HOLD cycle and every cycle before the policy produces
-    // output — this is a hot path, not an edge case. A zero request takes the
-    // mag <= f_n_max branch (no divide), so it passes through as a clean zero.
-    // No isfinite guard here: the EXPECT_NEAR checks below already fail on any
-    // NaN/inf (every comparison against NaN is false), so a separate finiteness
-    // assertion would only restate them. Non-finite INPUT is covered by
-    // ForceNonFiniteInputIsRejected, where finiteness is the actual contract.
+    // HOLD commands this 1000×/s: a hot path, not an edge case. EXPECT_NEAR
+    // already fails on NaN, so no separate isfinite assertion.
     SafetyFilter f = make();
 
     const ForceFilterResult r = f.clipForce(0.0);
@@ -161,9 +144,7 @@ TEST_F(SafetyFilterTest, ForceZeroInputDoesNotDivideByZero)
 
 TEST_F(SafetyFilterTest, ForceNonFiniteInputIsRejected)
 {
-    // A NaN reaching Kortex is undefined arm behaviour. The declared failure
-    // mode for the 1 kHz path is "arm holds", so a non-finite request must
-    // become a finite, zero command.
+    // Declared failure mode is "arm holds": non-finite in → finite zero out.
     SafetyFilter f = make();
     const double nan = std::numeric_limits<double>::quiet_NaN();
     const double inf = std::numeric_limits<double>::infinity();
@@ -178,10 +159,7 @@ TEST_F(SafetyFilterTest, ForceNonFiniteInputIsRejected)
     EXPECT_LE(std::abs(r_inf.value), bounds_.f_n_max + kTol);
     EXPECT_EQ(r_inf.reason, FilterReason::NON_FINITE_REJECTED);
 
-    // TELEMETRY. The original defect had two halves: mag <= f_n_max is false for
-    // NaN, so the input fell into the clipping branch, which BOTH returned NaN
-    // AND incremented force_scaled. Fixing only the output would leave O3
-    // counting phantom force clips. Pin both halves.
+    // Telemetry: an unguarded site counted NaN as a force clip. Pin both halves.
     EXPECT_EQ(f.interventions().non_finite_rejected, 2u);
     EXPECT_EQ(f.interventions().force_scaled, 0u)
         << "a non-finite input was counted as a force clip; O3 telemetry is corrupt";
@@ -206,7 +184,7 @@ TEST_F(SafetyFilterTest, TangentialWithinBoundPassesUnchanged)
 
 TEST_F(SafetyFilterTest, TangentialScalingPreservesDirection)
 {
-    // 3-4-5 triangle: |[0.3, 0.4]| = 0.5, so alpha = 0.15 / 0.5 = 0.3.
+    // |[0.3, 0.4]| = 0.5 ⇒ alpha = 0.15/0.5 = 0.3
     SafetyFilter f = make();
     const Twist6 t = makeTwist(0.3, 0.4, 0.0, 0.0, 0.0, 0.0);
 
@@ -215,8 +193,7 @@ TEST_F(SafetyFilterTest, TangentialScalingPreservesDirection)
     EXPECT_NEAR(r.alpha, 0.3, kTol);
     EXPECT_NEAR(r.twist(0), 0.09, kTol);
     EXPECT_NEAR(r.twist(1), 0.12, kTol);
-    // The property that matters: heading unchanged, speed reduced to the bound.
-    EXPECT_NEAR(r.twist(1) / r.twist(0), t(1) / t(0), kTol)
+    EXPECT_NEAR(r.twist(1) / r.twist(0), t(1) / t(0), kTol)   // heading unchanged
         << "slowing down also steered the tool";
     EXPECT_NEAR(std::hypot(r.twist(0), r.twist(1)), bounds_.v_tan_max, kTol);
     EXPECT_TRUE(hasReason(r.reasons, FilterReason::V_TAN_SCALED));
@@ -225,9 +202,8 @@ TEST_F(SafetyFilterTest, TangentialScalingPreservesDirection)
 
 TEST_F(SafetyFilterTest, NormalVelocityExcludedFromTangentialNorm)
 {
-    // STRUCTURAL — guards the vz-exclusion decision. The admittance reflex owns
-    // the normal axis; if vz ever enters the tangential norm there are two
-    // limiters in series on the force-controlled axis and neither is analysable.
+    // STRUCTURAL: the reflex owns vz; vz in the tangential norm = two limiters
+    // in series on the force-controlled axis.
     SafetyFilter f = make();
 
     // Case A: huge vz, tiny tangential.
@@ -237,7 +213,7 @@ TEST_F(SafetyFilterTest, NormalVelocityExcludedFromTangentialNorm)
     EXPECT_NEAR(ra.twist(2), 5.0, kTol) << "the reflex was throttled by Site 2";
     EXPECT_EQ(ra.num_interventions, 0);
 
-    // Case B: tangential exactly at the bound, huge vz. Still no scaling.
+    // Case B: tangential at the bound, huge vz. Still no scaling.
     const Twist6 b = makeTwist(bounds_.v_tan_max, 0.0, 5.0, 0.0, 0.0, 0.0);
     const CartesianFilterResult rb = f.clipCartesian(b, insideBox());
     EXPECT_NEAR(rb.alpha, 1.0, kTol);
@@ -246,10 +222,8 @@ TEST_F(SafetyFilterTest, NormalVelocityExcludedFromTangentialNorm)
 
 TEST_F(SafetyFilterTest, AngularScalingIndependentOfLinear)
 {
-    // COUPLING TEST. alpha and beta must come from two separate norms.
-    // This does NOT claim the linear:angular ratio is preserved — it is not,
-    // and cannot be, because vz is exempt from scaling by design. It claims
-    // only that one block going over-bound does not throttle the other.
+    // alpha and beta come from separate norms. This does NOT claim the
+    // linear:angular ratio is preserved (it cannot be — vz is exempt).
     SafetyFilter f = make();
 
     // Angular over, linear under => beta < 1, alpha == 1.
@@ -258,7 +232,7 @@ TEST_F(SafetyFilterTest, AngularScalingIndependentOfLinear)
     EXPECT_NEAR(ra.alpha, 1.0, kTol) << "angular clip bled into the linear block";
     EXPECT_NEAR(ra.twist(0), 0.01, kTol);
     EXPECT_NEAR(ra.beta, bounds_.omega_max / 1.0, kTol);
-    EXPECT_NEAR(ra.twist.tail<3>().norm(), bounds_.omega_max, kTol); // last 3 elements of twist
+    EXPECT_NEAR(ra.twist.tail<3>().norm(), bounds_.omega_max, kTol);
     EXPECT_TRUE(hasReason(ra.reasons, FilterReason::OMEGA_SCALED));
     EXPECT_FALSE(hasReason(ra.reasons, FilterReason::V_TAN_SCALED));
 
@@ -275,7 +249,7 @@ TEST_F(SafetyFilterTest, AngularScalingIndependentOfLinear)
 
 TEST_F(SafetyFilterTest, ZeroTwistDoesNotDivideByZero)
 {
-    // Runs on every HOLD cycle: 1000 times per second of hold.
+    // HOLD path, 1000×/s.
     SafetyFilter f = make();
 
     const CartesianFilterResult r = f.clipCartesian(Twist6::Zero(), insideBox());
@@ -290,10 +264,8 @@ TEST_F(SafetyFilterTest, ZeroTwistDoesNotDivideByZero)
 
 TEST_F(SafetyFilterTest, NonFiniteCartesianInputIsRejected)
 {
-    // Parity with Site 1: a NaN/inf twist, or a non-finite EE position gating
-    // the workspace refusal, must hold the arm rather than reach Kortex. The
-    // norm math cannot catch it — sqrt(NaN) and every over-bound comparison are
-    // false/NaN, so an unguarded Site 2 sprays the NaN across the whole twist.
+    // Parity with Site 1. The norm math cannot catch NaN (comparisons are false),
+    // so an unguarded Site 2 sprays it across the whole twist.
     SafetyFilter f = make();
     const double nan = std::numeric_limits<double>::quiet_NaN();
     const double inf = std::numeric_limits<double>::infinity();
@@ -313,7 +285,7 @@ TEST_F(SafetyFilterTest, NonFiniteCartesianInputIsRejected)
     EXPECT_NEAR(r_inf.twist.norm(), 0.0, kTol);
     EXPECT_TRUE(hasReason(r_inf.reasons, FilterReason::NON_FINITE_REJECTED));
 
-    // Non-finite EE position (bad FK) with a finite twist is equally fatal.
+    // Non-finite EE position (bad FK) with a finite twist.
     const Eigen::Vector3d bad_pos(0.0, nan, 0.35);
     const CartesianFilterResult r_pos =
         f.clipCartesian(makeTwist(0.05, 0.0, 0.0, 0.0, 0.0, 0.0), bad_pos);
@@ -321,10 +293,8 @@ TEST_F(SafetyFilterTest, NonFiniteCartesianInputIsRejected)
     EXPECT_NEAR(r_pos.twist.norm(), 0.0, kTol);
     EXPECT_TRUE(hasReason(r_pos.reasons, FilterReason::NON_FINITE_REJECTED));
 
-    // TELEMETRY. Three rejects, and NONE of them may be attributed to a bound.
-    // omega_scaled is the sharp one: |[inf,0,0]| > omega_max is TRUE, so an
-    // unguarded Site 2 would have logged the inf twist as a legitimate angular
-    // clip — a real intervention that never happened, in the O3 count.
+    // Telemetry: |[inf,0,0]| > omega_max is TRUE, so an unguarded site logs a
+    // phantom angular clip into the O3 count.
     EXPECT_EQ(f.interventions().non_finite_rejected, 3u);
     EXPECT_EQ(f.interventions().v_tan_scaled, 0u);
     EXPECT_EQ(f.interventions().omega_scaled, 0u)
@@ -349,8 +319,7 @@ TEST_F(SafetyFilterTest, WorkspaceRefusalZerosOnlyOutwardComponent)
 
 TEST_F(SafetyFilterTest, WorkspaceAllowsInwardMotionWhenOutsideBox)
 {
-    // RECOVERY. Without this the arm is trapped the first time it drifts out —
-    // every command gets zeroed including the one that would rescue it.
+    // RECOVERY: otherwise an arm that drifts out is trapped.
     SafetyFilter f = make();
 
     // Past +x, driving back toward -x.
@@ -360,7 +329,7 @@ TEST_F(SafetyFilterTest, WorkspaceAllowsInwardMotionWhenOutsideBox)
     EXPECT_NEAR(rx.twist(0), -0.05, kTol) << "inward motion refused; arm is stuck";
     EXPECT_FALSE(hasReason(rx.reasons, FilterReason::WORKSPACE_REFUSED));
 
-    // Below z_min, driving back up. This is the table-collision case.
+    // Below z_min, driving back up (table-collision case).
     const Eigen::Vector3d below_z(0.0, 0.0, bounds_.ws_z_min - 0.01);
     const CartesianFilterResult rz =
         f.clipCartesian(makeTwist(0.0, 0.0, 0.05, 0.0, 0.0, 0.0), below_z);
@@ -372,7 +341,7 @@ TEST_F(SafetyFilterTest, WorkspaceAllowsInwardMotionWhenOutsideBox)
 
 TEST_F(SafetyFilterTest, WorkspaceRefusalIsReportedSeparatelyFromScaling)
 {
-    // Two different problems in one cycle must be logged as two.
+    // Two problems in one cycle are logged as two.
     SafetyFilter f = make();
     const Eigen::Vector3d outside(bounds_.ws_x_max + 0.01, 0.0, 0.35);
     const Twist6 t = makeTwist(0.3, 0.4, 0.0, 0.0, 0.0, 0.0);  // |v_tan| = 0.5
@@ -385,8 +354,7 @@ TEST_F(SafetyFilterTest, WorkspaceRefusalIsReportedSeparatelyFromScaling)
     EXPECT_EQ(f.interventions().v_tan_scaled, 1u);
     EXPECT_EQ(f.interventions().workspace_refused, 1u);
 
-    // Order-independent: whichever runs first(either vel clipping or workspace refusal),
-    // both designs must follow the rules.
+    // Order-independent: both rules hold whichever runs first.
     EXPECT_NEAR(r.twist(0), 0.0, kTol);
     EXPECT_LE(std::hypot(r.twist(0), r.twist(1)), bounds_.v_tan_max + kTol);
 }
@@ -410,8 +378,8 @@ TEST_F(SafetyFilterTest, JointVelocityWithinCapsPassesUnchanged)
 
 TEST_F(SafetyFilterTest, UniformScalingUsesTightestJointRatio)
 {
-    // Joint 0 over by 2x (ratio 0.5), joint 4 over by 4x (ratio 0.25).
-    // Both are continuous-rotation joints, so no position refusal can interfere.
+    // Joint 0 over 2x (ratio 0.5), joint 4 over 4x (ratio 0.25); both continuous,
+    // so no position refusal interferes.
     SafetyFilter f = make();
     Joint7 qd = Joint7::Zero();
     qd(0) = 2.0 * bounds_.joint_vel_max[0];
@@ -430,8 +398,7 @@ TEST_F(SafetyFilterTest, UniformScalingUsesTightestJointRatio)
 
 TEST_F(SafetyFilterTest, UniformScalingPreservesJointSpaceDirection)
 {
-    // Per-joint clipping would satisfy the caps and silently change where the
-    // end-effector goes. Uniform scaling changes only how fast it gets there.
+    // Per-joint clipping would satisfy the caps and change where the EE goes.
     SafetyFilter f = make();
     const Joint7 qd = makeJoint(1.0, -2.0, 3.0, -4.0, 5.0, -6.0, 7.0);
 
@@ -451,8 +418,8 @@ TEST_F(SafetyFilterTest, UniformScalingPreservesJointSpaceDirection)
 
 TEST_F(SafetyFilterTest, SmallActuatorCapIsHigherThanLargeActuatorCap)
 {
-    // Guards the actuator table against a copy-paste regression.
-    // [SPEC] Kortex actuator spec: joints 1-4 = 120 deg/s, joints 5-7 = 200 deg/s.
+    // Guards the [SPEC] table (120 deg/s joints 1-4, 200 deg/s joints 5-7) against
+    // a copy-paste regression.
     for (std::size_t i = 0; i < 4; ++i)
     {
         EXPECT_NEAR(bounds_.joint_vel_max[i], 2.0944, 1e-4) << "large actuator " << i;
@@ -463,10 +430,9 @@ TEST_F(SafetyFilterTest, SmallActuatorCapIsHigherThanLargeActuatorCap)
     }
     EXPECT_GT(bounds_.joint_vel_max[4], bounds_.joint_vel_max[3]);
 
-    // Position limits: only joints 2, 4, 6 (0-indexed 1, 3, 5) are bounded.
-    // NOTE: these literals duplicate KinovaKinematics.cpp and already disagree
-    // at the 4th digit. When the manifest lands, this test reads the manifest
-    // and this comment goes away.
+    // Only joints 2, 4, 6 (indices 1, 3, 5) are bounded [SPEC Table 39]. These
+    // literals duplicate KinovaKinematics.cpp and disagree at the 4th digit —
+    // D-27; this test reads the manifest once D-04 lands.
     for (const std::size_t i : {std::size_t{0}, std::size_t{2}, std::size_t{4}, std::size_t{6}})
     {
         EXPECT_GT(bounds_.joint_pos_max[i], 100.0) << "joint " << i << " must be continuous";
@@ -479,16 +445,15 @@ TEST_F(SafetyFilterTest, SmallActuatorCapIsHigherThanLargeActuatorCap)
 
 TEST_F(SafetyFilterTest, PositionRefusalZerosOnlyOffendingJoint)
 {
-    // Bit convention: bit j (0-indexed) = joint index j = physical joint j+1.
-    // If the .cpp is 1-indexed, fix the .cpp — the arrays it indexes are 0-based.
+    // Bit j (0-indexed) = joint index j = physical joint j+1.
     SafetyFilter f = make();
 
     Joint7 q_send = Joint7::Zero();
-    q_send(1) = bounds_.joint_pos_max[1] - 0.0005;   // 0.5 millirad inside the limit
+    q_send(1) = bounds_.joint_pos_max[1] - 0.0005;   // 0.5 mrad inside the limit
 
-    Joint7 qd = Joint7::Constant(0.1);               // all well under their caps
-    qd(1) = 2.0;                                     // under cap 2.0944, so no vel scaling
-    // lookahead: q_send(1) + 2.0 * 0.001 = limit + 0.0015  ->  crosses
+    Joint7 qd = Joint7::Constant(0.1);
+    qd(1) = 2.0;                                     // under the 2.0944 cap: no vel scaling
+    // lookahead q_send(1) + 2.0·0.001 = limit + 0.0015 → crosses
 
     const JointFilterResult r = f.clipJoint(qd, q_send);
 
@@ -507,10 +472,8 @@ TEST_F(SafetyFilterTest, PositionRefusalZerosOnlyOffendingJoint)
 
 TEST_F(SafetyFilterTest, PositionRefusalAllowsMotionAwayFromLimit)
 {
-    // RECOVERY. The arm can end up outside a limit by overshoot, by a bad seed
-    // at startup, or by manual jogging before the run. If the check is not
-    // directional, every command from that pose is zeroed and the joint is
-    // stuck until someone power-cycles the arm.
+    // RECOVERY: overshoot, bad seed or manual jogging can leave a joint outside
+    // its limit; a non-directional check would strand it.
     SafetyFilter f = make();
 
     // Past the upper limit, driving negative (back inside).
@@ -538,8 +501,8 @@ TEST_F(SafetyFilterTest, PositionRefusalAllowsMotionAwayFromLimit)
 
 TEST_F(SafetyFilterTest, ContinuousJointsNeverPositionRefuse)
 {
-    // Joints 1, 3, 5, 7 (0-indexed 0, 2, 4, 6) rotate without limit. A commanded
-    // anchor that has integrated past 2*pi must not trip a phantom limit.
+    // Joints 1, 3, 5, 7 (indices 0, 2, 4, 6) are continuous; an anchor past 2π
+    // must not trip a phantom limit (D-27: ±2π elsewhere would).
     SafetyFilter f = make();
 
     Joint7 q_send = Joint7::Zero();
@@ -562,7 +525,7 @@ TEST_F(SafetyFilterTest, ContinuousJointsNeverPositionRefuse)
 
 TEST_F(SafetyFilterTest, ZeroJointVelocityDoesNotDivideByZero)
 {
-    // The HOLD state commands exactly this, 1000 times a second.
+    // HOLD path, 1000×/s.
     SafetyFilter f = make();
 
     const JointFilterResult r = f.clipJoint(Joint7::Zero(), Joint7::Zero());
@@ -573,8 +536,7 @@ TEST_F(SafetyFilterTest, ZeroJointVelocityDoesNotDivideByZero)
     EXPECT_EQ(r.pos_refused_mask, 0u);
     EXPECT_EQ(r.num_interventions, 0);
 
-    // Parked exactly on a limit with zero velocity is not a violation —
-    // zero motion cannot cross anything.
+    // Parked on a limit with zero velocity is not a violation.
     Joint7 q_at_limit = Joint7::Zero();
     q_at_limit(1) = bounds_.joint_pos_max[1];
     const JointFilterResult r2 = f.clipJoint(Joint7::Zero(), q_at_limit);
@@ -585,12 +547,8 @@ TEST_F(SafetyFilterTest, ZeroJointVelocityDoesNotDivideByZero)
 
 TEST_F(SafetyFilterTest, NonFiniteJointInputIsRejected)
 {
-    // A NaN/inf joint command reaching Kortex is undefined arm behaviour; the
-    // declared failure mode is "hold", so a non-finite request must become a
-    // finite, zero command. The bare velocity/position logic cannot catch this:
-    // every comparison against NaN is false, so an unguarded filter passes it
-    // straight through untouched. This test fails against a filter with no
-    // isfinite guard.
+    // Declared failure mode is "hold". Comparisons against NaN are false, so an
+    // unguarded filter passes it through untouched.
     SafetyFilter f = make();
     const double nan = std::numeric_limits<double>::quiet_NaN();
     const double inf = std::numeric_limits<double>::infinity();
@@ -603,9 +561,8 @@ TEST_F(SafetyFilterTest, NonFiniteJointInputIsRejected)
     EXPECT_NEAR(r_nan.qdot.norm(), 0.0, kTol) << "non-finite input must hold";
     EXPECT_TRUE(hasReason(r_nan.reasons, FilterReason::NON_FINITE_REJECTED));
     EXPECT_EQ(r_nan.num_interventions, 1);
-    // STRUCTURAL. mask 0, not all-ones: no joint hit a limit — the whole input
-    // was garbage. A reader of the log must be able to tell "joint 4 reached its
-    // limit" apart from "IK returned NaN", and the mask is where that shows.
+    // STRUCTURAL: mask 0, not all-ones — logs must tell "joint hit a limit" from
+    // "IK returned NaN".
     EXPECT_EQ(r_nan.pos_refused_mask, 0u)
         << "a non-finite reject was reported as a joint-limit refusal";
 
@@ -618,9 +575,7 @@ TEST_F(SafetyFilterTest, NonFiniteJointInputIsRejected)
     EXPECT_TRUE(hasReason(r_inf.reasons, FilterReason::NON_FINITE_REJECTED));
     EXPECT_EQ(r_inf.pos_refused_mask, 0u);
 
-    // A non-finite anchor (bad feedback or IK seed) with a finite command is
-    // equally fatal: the lookahead q_send + q̇*dt becomes NaN and every limit
-    // comparison silently passes.
+    // Non-finite anchor: the lookahead becomes NaN and every limit check passes.
     Joint7 q_bad = Joint7::Zero();
     q_bad(2) = nan;
     const JointFilterResult r_q = f.clipJoint(Joint7::Constant(0.1), q_bad);
@@ -629,9 +584,8 @@ TEST_F(SafetyFilterTest, NonFiniteJointInputIsRejected)
     EXPECT_TRUE(hasReason(r_q.reasons, FilterReason::NON_FINITE_REJECTED));
     EXPECT_EQ(r_q.pos_refused_mask, 0u);
 
-    // TELEMETRY. joint_vel_scaled is the sharp one here: |inf| > joint_vel_max[5]
-    // is TRUE, so an unguarded Site 3 would have computed alpha = cap/inf = 0,
-    // taken the alpha < 1 branch, and logged a legitimate velocity clip.
+    // Telemetry: |inf| > cap is TRUE ⇒ alpha = 0 ⇒ an unguarded site logs a
+    // phantom velocity clip.
     EXPECT_EQ(f.interventions().non_finite_rejected, 3u);
     EXPECT_EQ(f.interventions().joint_vel_scaled, 0u)
         << "an inf velocity was counted as a joint-velocity clip; O3 is corrupt";
@@ -661,7 +615,7 @@ TEST_F(SafetyFilterTest, CounterAccumulatesAcrossCalls)
 
 TEST_F(SafetyFilterTest, CounterTotalEqualsSumOfFields)
 {
-    // Trigger each bound exactly once, in isolation.
+    // Each bound exactly once, in isolation.
     SafetyFilter f = make();
 
     f.clipForce(100.0);                                                        // force
@@ -690,8 +644,7 @@ TEST_F(SafetyFilterTest, CounterTotalEqualsSumOfFields)
     EXPECT_EQ(c.joint_vel_scaled, 1u);
     EXPECT_EQ(c.joint_pos_refused, 1u);
     EXPECT_EQ(c.non_finite_rejected, 1u);
-    // If total() does not sum every field this is where it shows. Each field is
-    // pinned above, so a mismatch here is total(), not the counting.
+    // Fields are pinned above, so a mismatch here is total(), not the counting.
     EXPECT_EQ(c.total(), 7u);
 }
 
@@ -702,8 +655,7 @@ TEST_F(SafetyFilterTest, CounterResetClearsEveryField)
     f.clipForce(100.0);
     f.clipCartesian(makeTwist(0.3, 0.4, 0.0, 1.0, 0.0, 0.0), insideBox());
     f.clipForce(std::numeric_limits<double>::quiet_NaN());
-    // Every field must be non-zero BEFORE the reset, or the corresponding
-    // assertion after it passes vacuously and proves nothing about reset().
+    // Non-zero before reset, or the post-reset assertions are vacuous.
     ASSERT_GT(f.interventions().non_finite_rejected, 0u)
         << "non_finite_rejected never set — its reset assertion would be vacuous";
     ASSERT_GT(f.interventions().total(), 0u) << "nothing to reset — test is vacuous";
@@ -723,8 +675,7 @@ TEST_F(SafetyFilterTest, CounterResetClearsEveryField)
 
 TEST_F(SafetyFilterTest, PassingCallsDoNotIncrementAnyCounter)
 {
-    // O3 rests entirely on this: a filter that never fires must report zero.
-    // One second of nominal operation at 1 kHz.
+    // O3 rests on this: one second of nominal 1 kHz operation, zero interventions.
     SafetyFilter f = make();
 
     Joint7 qd_ok;

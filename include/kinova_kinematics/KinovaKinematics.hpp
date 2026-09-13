@@ -1,7 +1,19 @@
 /**
  * @file KinovaKinematics.hpp
- * @brief FK, numerical Jacobian, and DLS IK solver for Kinova Gen3 7-DOF arm.
- *        Uses Classical DH convention (8 frames, rows 0-7).
+ * @brief FK, numerical Jacobian, DLS differential IK, manipulability monitor and an
+ *        offline pose solver for the Kinova Gen3 7-DOF. Classical DH, 8 frames, radians.
+ *
+ * ── KinovaKinematics ─────────────────────────────────────────────────────────
+ * Layer:   Below the contract (adapter), 1 kHz path
+ * Side:    OBS    computeFK / getPosition / getRotation  (q_meas → pose, 6D rotation)
+ *          ACTION computeJacobian / jointVelocityDLS / solveDLS (twist → q̇)
+ *          monitor manipulability()   offline solveIK (never on the loop)
+ * In:      q_meas [rad] (OBS+ACTION); twist_des, BASE frame [m/s, rad/s] (ACTION)
+ * Out:     T in BASE [m] (OBS); q̇ [rad/s], 7 elements (ACTION)
+ * Frames:  task→base rotation is the caller's job; this file never sees the task frame
+ * Fails:   non-finite q / J / twist / λ → ok=false, q̇ = 0; near-singular J → damped (BOUND-1)
+ * Ref:     design.md §3–§6, D-14, D-20, D-25, D-26, D-27
+ * ─────────────────────────────────────────────────────────────────────────────
  */
 
 #pragma once
@@ -11,18 +23,17 @@
 #include<limits>
 
 /**
- * @brief Result of one differential inverse-kinematics solve.
+ * @brief Result of one differential inverse-kinematics solve. ACTION side.
  *
- * On failure every field is left at its default: q_dot_deg_s is all zeros,
- * ok is false. A caller that ignores @ref ok therefore commands zero motion
- * rather than garbage — the failure mode is "arm holds", not "arm jumps".
+ * On failure every field stays at its default: qdot all zeros, ok false. A caller
+ * that ignores @ref ok therefore commands zero motion — "arm holds", not "arm jumps".
  */
 struct DlsResult
 {
     Eigen::Matrix<double,7,1> qdot           = Eigen::Matrix<double,7,1>::Zero();  ///< [rad/s], joints 1..7
     Eigen::Matrix<double,6,1> twist_achieved = Eigen::Matrix<double,6,1>::Zero();  ///< J*qdot, BASE frame [m/s; rad/s]
     double lambda_used    = std::numeric_limits<double>::quiet_NaN();
-    double manipulability = std::numeric_limits<double>::quiet_NaN();  ///< P22 — NOT computed yet, metric deferred
+    double manipulability = std::numeric_limits<double>::quiet_NaN();  ///< NaN by design (D-20): never computed here; 0.0 would mean "singular"
     bool   ok             = false;                                     ///< false => qdot is zero, do not command
 };
 
@@ -51,23 +62,26 @@ class KinovaKinematics{
 
         /**
          * @brief Constructor — populates Classical DH table for Kinova Gen3.
-         * @param tool_offset_z  Distance [m] along the tool's local z-axis from
-         *                       the final DH frame to the tip FK is computed
-         *                       w.r.t. Tool-dependent (D-14): a parameter, never
-         *                       a literal. Default 0.113 m = current test handle.
+         * @param tool_offset_z  Distance [m] along the final frame's local z from
+         *                       flange to the tip FK reports. Tool-dependent (D-14):
+         *                       a parameter, never a literal. Default 0.113 m
+         *                       [MEASURED] flange-to-tip of the current test handle;
+         *                       Kortex is configured at 0.12 m, so FK-vs-Kortex carries
+         *                       ~7 mm by construction.
          */
         explicit KinovaKinematics(double tool_offset_z = 0.113);
 
         /**
-         * @brief Compute forward kinematics using Classical DH chain.
-         * @param joint_angles 7 joint angles in radians.
-         * @return 4x4 homogeneous transform of end-effector in base frame.
+         * @brief Forward kinematics, classical DH chain. OBS side.
+         * @param joint_angles 7 joint angles [rad].
+         * @return 4x4 pose of the tool tip in the BASE frame [m].
          */
         Eigen::Matrix4d computeFK(const std::array<double, 7> &joint_angles) const;
 
         /**
          * @brief Map a desired Cartesian twist to joint velocities by damped
-         *        least squares. Pure map: no state, no clamping, no null space.
+         *        least squares. ACTION side, 1 kHz entry point. Pure map: no state,
+         *        no clamping, no null space.
          *
          * Solves  (J·Jᵀ + λ²·I₆)·y = twist,  then  q̇ = Jᵀ·y.
          * Equivalent to q̇ = Jᵀ(J·Jᵀ + λ²I)⁻¹·twist without forming any inverse.
@@ -83,50 +97,52 @@ class KinovaKinematics{
          * @param q_meas_rad Measured joint angles [rad], from BaseCyclic feedback.
          * @param twist_des  Desired end-effector twist, base frame:
          *                   rows 0-2 linear [m/s], rows 3-5 angular [rad/s].
-         * @param lambda     Damping factor, must be > 0. Peak joint amplification
-         *                   is 1/(2λ), reached when a singular value σ equals λ.
-         *                   λ is therefore a threshold on σ, and the σ spectrum
-         *                   depends on the arm's geometry — λ must be re-tuned
-         *                   per robot (design.md §5.4.1). It lives in the adapter,
-         *                   below the interface contract, so a per-robot λ does
-         *                   not weaken the portability claim.
-         * @return DlsResult; check ok before using q_dot_rad.
+         * @param lambda     Damping, must be > 0 and finite. Peak amplification is
+         *                   1/(2λ) at σ = λ [DERIVED, design.md §5.3.2]. λ is a
+         *                   threshold on σ and the σ spectrum is arm-specific, so λ
+         *                   is re-tuned per robot (design.md §5.3.4). It lives in the
+         *                   adapter, below the contract. Provisional 0.05 [DESIGN];
+         *                   set by the λ sweep.
+         * @return DlsResult; check ok before using qdot.
          */
         DlsResult jointVelocityDLS(const std::array<double,7>& q_meas_rad,
                                    const Eigen::Matrix<double,6,1>& twist_des,
                                    double lambda) const;
 
         /**
-         * @brief Extract [x, y, z] position from a 4x4 homogeneous transform.
-         * @param transform 4x4 homogeneous transform matrix.
-         * @return 3x1 position vector (meters).
+         * @brief Extract position from a 4x4 transform. OBS side.
+         * @return [x, y, z] in the transform's frame (BASE for computeFK output) [m].
          */
         Eigen::Vector3d getPosition(const Eigen::Matrix4d &transform) const;
 
         /**
-         * @brief Extract 3x3 rotation matrix from a 4x4 homogeneous transform.
-         * @param transform 4x4 homogeneous transform matrix.
-         * @return 3x3 rotation matrix.
+         * @brief Extract the 3x3 rotation from a 4x4 transform. OBS side.
+         * @return R. Columns 0 and 1 are the 6D orientation observation as-is — no
+         *         Gram-Schmidt anywhere in the loop; nothing is reconstructed from it.
          */
         Eigen::Matrix3d getRotation(const Eigen::Matrix4d& transform) const;
 
         /**
-         * @brief Compute numerical Jacobian via finite differences.
-         *        Top 3 rows: linear velocity (m/rad).
-         *        Bottom 3 rows: angular velocity (rad/rad).
-         * @param joint_angles Current joint configuration (radians).
-         * @return 6x7 Jacobian matrix.
+         * @brief Geometric Jacobian by forward finite difference, eps = 1e-6 rad
+         *        [DESIGN, unswept]. ACTION side; evaluate at the MEASURED q.
+         *        Rows 0-2 [m/rad], rows 3-5 dimensionless. BASE frame.
+         * @param joint_angles Joint configuration [rad].
+         * @return 6x7 Jacobian.
          */
         Eigen::Matrix<double,6,7> computeJacobian(const std::array<double,7> &joint_angles) const;
 
         /**
-         * @brief Solve IK using damped least squares (Levenberg-Marquardt).
-         * @param target_pose Desired EE pose as 4x4 homogeneous transform.
-         * @param initial_guess Starting joint configuration (radians).
-         * @param max_iterations Maximum solver iterations (default: 300).
-         * @param position_tol Convergence threshold for position error in meters (default: 1e-4 = 0.1mm).
-         * @param orientation_tol Convergence threshold for orientation error in radians (default: 1e-3 ≈ 0.057°).
-         * @return IKResult with success flag, joint angles, and final errors.
+         * @brief Iterative pose IK: damped least squares with error-proportional
+         *        damping plus a null-space joint-centring term. OFFLINE ONLY — dynamic
+         *        Eigen, explicit inverse, std::cerr; never on the 1 kHz path.
+         * @param target_pose    Desired tool pose, BASE frame [m].
+         * @param initial_guess  Starting configuration [rad].
+         * @param max_iterations Default 300 [DESIGN]. <= 0 returns failure, errors -1.0.
+         * @param position_tol   [m], default 1e-4 [DESIGN].
+         * @param orientation_tol [rad], default 1e-3 [DESIGN].
+         * @return IKResult. On failure joint_states holds the LAST ITERATE, not a solution —
+         *         useful for seeing where the solver stalled. Any caller must check success
+         *         before using it; never feed this output to the 1 kHz path.
          */
         IKResult solveIK(
             const Eigen::Matrix4d& target_pose,
@@ -137,13 +153,12 @@ class KinovaKinematics{
         )const;
 
         /**
-         * @brief Linear-algebra core of jointVelocityDLS, with the Jacobian
-         *        supplied directly. Exists so the solve can be unit-tested
-         *        against hand-computed matrices without a DH table.
-         * @param J         6x7 Jacobian [m/rad; rad/rad].
-         * @param twist_des Desired twist [m/s; rad/s].
-         * @param lambda    Damping, > 0.
-         * @return DLSResult struct
+         * @brief Linear-algebra core of jointVelocityDLS with J injected. Public so
+         *        the solve is unit-testable against hand-built Jacobians (D-26).
+         * @param J         6x7 Jacobian, BASE [m/rad; dimensionless].
+         * @param twist_des Desired twist, BASE [m/s; rad/s].
+         * @param lambda    Damping, > 0 and finite.
+         * @return DlsResult.
          */
         DlsResult solveDLS(const Eigen::Matrix<double,6,7>& J,
                    const Eigen::Matrix<double,6,1>& twist_des,
@@ -152,13 +167,13 @@ class KinovaKinematics{
         double getToolOffsetZ() const { return tool_offset_z_; }
 
         /**
-         * @brief Yoshikawa manipulability index w = sqrt(det(J·Jᵀ)) — a singularity
-         *        MONITOR. Not an observation element, not a policy input. Separate
-         *        from DlsResult::manipulability, which stays NaN by D-20 (P22).
-         * @param J 6x7 Jacobian at the measured config [m/rad; rad/rad].
-         * @return w >= 0. w == 0.0 means "exactly singular" (a real value).
-         *         Returns NaN when J is non-finite ("could not compute" — distinct
-         *         from 0.0 so the loop never confuses the two).
+         * @brief Yoshikawa manipulability w = sqrt(det(J·Jᵀ)) — a singularity MONITOR
+         *        for the loop. Never an observation element (robot-specific; stays
+         *        below the contract). DlsResult::manipulability stays NaN by D-20.
+         *        Carries the mixed-units wart of design.md §5.3.3.
+         * @param J 6x7 Jacobian at the measured q.
+         * @return w >= 0; 0.0 means "exactly singular" (a real value). NaN when J is
+         *         non-finite ("could not compute") — distinct from 0.0 on purpose.
          */
         double manipulability(const Eigen::Matrix<double,6,7>& J) const;
 
@@ -166,22 +181,23 @@ class KinovaKinematics{
     private:
 
         /**
-         * @brief Build 4x4 Classical DH transform for one joint.
-         *        Order: Rot_z(theta) · Trans_z(d) · Trans_x(a) · Rot_x(alpha)
-         * @param alpha Twist angle (radians).
-         * @param a Link length (meters).
-         * @param d Link offset (meters).
-         * @param theta Joint angle + offset (radians).
-         * @return 4x4 homogeneous transform from frame (i-1) to frame (i).
+         * @brief One classical DH link: Rot_z(theta) · Trans_z(d) · Trans_x(a) · Rot_x(alpha).
+         * @return Transform from frame (i-1) to frame (i). alpha, theta [rad]; a, d [m].
          */
         Eigen::Matrix4d dhTransform(double alpha, double a, double d, double theta) const;
         
-        // Z0=pushes each angle towards its center
+        // Null-space secondary objective for solveIK: gradient pushing each joint
+        // toward the centre of its range. Offline only.
         Eigen::VectorXd jointLimitGradient(const std::array<double,7> & joint_angles) const;
         
-        // Classical DH table: 8 rows (row 0 = base frame, rows 1-7 = joints 1-7)
+        // Classical DH table: 8 rows (row 0 = base frame, rows 1-7 = joints 1-7).
+        // Link lengths [SPEC] Kinova Gen3 kinematic parameters; convention [MEASURED].
         std::array<DHParam,8> dh_params_;
 
+        // Joint range used ONLY by jointLimitGradient (solveIK). Duplicates
+        // SafetyFilter.hpp with different values and different continuous-joint
+        // sentinels (±2π here, ±1e9 there) — D-27, single manifest required.
+        // Not used for enforcement: Site 3 of the SafetyFilter is the only enforcer.
         std::array<double,7> joint_min_;
         std::array<double,7> joint_max_;
         double tool_offset_z_;   // D-14: tool-dependent, set at construction

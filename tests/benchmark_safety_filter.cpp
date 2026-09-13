@@ -1,85 +1,32 @@
 /**
  * @file benchmark_safety_filter.cpp
- * @brief O3 latency benchmark for the three-site SafetyFilter on the 1 kHz path.
- *        Times one full filter CYCLE — clipForce -> clipCartesian -> clipJoint —
- *        under four input scenarios, because this code (unlike jointVelocityDLS)
- *        has data-dependent branches and therefore has no single worst case.
- *
- * @author Sahil Narola — Phase 0, Step 6.4 (safety filter), O3 telemetry
+ * @brief Latency of one full SafetyFilter cycle (clipForce → clipCartesian → clipJoint)
+ *        under four input scenarios, with counter self-checks. Step 6.4, O3 telemetry.
+ *        Layer: below the contract, ACTION side.
+ *          Site 1  F*n [N], tool z
+ *          Site 2  task-frame twist [m/s, rad/s]; ee_pos_base [m] is OBSERVED
+ *          Site 3  q̇ [rad/s]; q_send [rad] is the COMMANDED anchor (P19)
+ * @author Sahil Narola
  * @date   August 2026
  *
- * Layer: BELOW THE CONTRACT (adapter). Command/action side.
- *   Site 1  ACTION      : F*n [N], tool-z
- *   Site 2  COMMAND     : task-frame twist [m/s, rad/s]; ee_pos_base [m] is OBSERVED
- *   Site 3  COMMAND     : joint rates [rad/s]; q_send [rad] is the COMMANDED anchor (P19)
- *
- * Run pinned + real-time — host scheduling is owned by the invocation, not this file,
- * and the protocol must match benchmark_dls exactly or the two numbers cannot be added:
+ * Protocol must match benchmark_dls exactly or the two numbers cannot be compared:
  *   chrt -f 80 taskset -c 2 ./benchmark_safety_filter filter_latency
+ *   RelWithDebInfo (-O2 -g -DNDEBUG), NOT Release. [MEASURED 4 Sep 2026] both benchmark
+ *   targets received -O2 -g -DNDEBUG -std=gnu++17 per compile_commands.json; re-verify
+ *   after any toolchain or CMake change. This package reads no USE_KORTEX_MOCK flag.
  *
- * BUILD TYPE IS PART OF THE PROTOCOL.
- *   Eigen relies on inlining to collapse expression templates; at -O0 that collapse
- *   does not happen and the number is pessimistic by a large, unknown factor.
- *   Required — and it must be RelWithDebInfo, NOT Release, so this matches the flags
- *   benchmark_dls was measured under. Release is -O3 with no -g; mixing the two makes
- *   the numbers non-additive, which defeats the purpose of matching the protocol:
- *     colcon build --packages-select kinova_kinematics \
- *       --cmake-args -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_KORTEX_MOCK=ON
+ * "O3" here is the project requirement ID (zero bound violations across every reported
+ * run), not the -O3 compiler flag.
  *
- *   [VERIFIED 4 Sep 2026] CMAKE_BUILD_TYPE:STRING=RelWithDebInfo in
- *   build/kinova_kinematics/CMakeCache.txt; compile_commands.json shows this target
- *   and benchmark_dls both received:  -O2 -g -DNDEBUG -std=gnu++17
- *   Re-verify after any toolchain or CMake change:
- *     python3 -c "import json; print(*[e['command'] for e in json.load(open( \
- *       'build/kinova_kinematics/compile_commands.json')) \
- *       if 'benchmark_safety_filter' in e['file']], sep='\n')"
+ * Method (deltas from benchmark_dls are deliberate): four scenarios because the filter
+ * has data-dependent branches and no single worst case; three sites timed together
+ * (all run every cycle); inputs cycled from a 64-entry table so the call cannot be
+ * hoisted [UNVERIFIED: table footprint vs this CPU's L1d]; counter deltas asserted per
+ * scenario so a scenario cannot silently fail to exercise its branches; batched mean
+ * reported next to the per-iteration distribution (percentiles come from the latter).
  *
- *   NOTE ON THE NAME: "O3" in this file is the project REQUIREMENT ID (zero bound
- *   violations across every reported run). It is not the -O3 compiler flag. The two
- *   must never be conflated in the paper or in design.md.
- *
- * Method notes (deltas from benchmark_dls are deliberate; everything else is identical):
- *  - FOUR scenarios, not one. NOMINAL is the deployment path (D-09: bounds sit just
- *    outside the trained action distribution, so the filter should be silent).
- *    ALL_TRIP is maximum work. ALTERNATING defeats the branch predictor and may beat
- *    both. NON_FINITE exercises the reject path added with FilterReason::
- *    NON_FINITE_REJECTED, which is currently green but untimed.
- *  - The three sites are timed TOGETHER. The 1 kHz budget is spent per cycle, and all
- *    three run every cycle; per-site numbers would have to be re-added anyway and each
- *    would carry its own clock-read overhead.
- *  - Inputs are cycled from a small pre-built table rather than being loop constants,
- *    so the compiler cannot hoist the call out of the loop. The table is sized to stay
- *    in L1d.  [UNVERIFIED] table footprint vs this CPU's L1d — check with lscpu if the
- *    tail looks wrong.
- *  - SELF-CHECK ON THE COUNTERS. A benchmark that believes it is exercising the worst
- *    case but silently isn't is worse than no benchmark. Each scenario asserts the
- *    InterventionCounter deltas it expects and fails loudly if they disagree.
- *  - Batched (amortised) mean is reported alongside the per-iteration distribution.
- *    A single filter cycle is expected to land near the cost of two steady_clock reads,
- *    so the per-iteration mean is clock-contaminated; the batched mean is not. The
- *    percentiles still come from the per-iteration run — batching destroys the tail.
- *  - steady_clock is correct here: this measures an ELAPSED INTERVAL. The project rule
- *    preferring an absolute cycle anchor applies to COMMAND generation, not measurement.
- *
- * ── MEASURED  [4 Sep 2026, RelWithDebInfo, chrt -f 80 taskset -c 2, N = 1e6] ──────
- *
- *   scenario       mean   batched    p50    p99   p99.9     max      (all ns)
- *   NOMINAL        21.0     10.0      21     27      35    5391
- *   ALL_TRIP       30.2     15.0      30     36      39    1311
- *   ALTERNATING    25.6     12.6      28     35      40    1142
- *   NON_FINITE     12.6      5.1      13     14      21     785
- *   clock floor (min of 1e5 paired reads): 9 ns
- *
- *   Reportable: worst p99.9 across scenarios <= 40 ns = 0.004 % of the 1 kHz budget.
- *   The BATCHED column is the true cycle cost (5-15 ns). The per-iteration mean sits
- *   ~1 clock floor above it, exactly as predicted above — do not report the mean.
- *
- *   Do NOT claim ALTERNATING is the worst case. Its p99.9 beats ALL_TRIP by 1 ns at a
- *   9 ns clock resolution; the four scenarios are indistinguishable in the tail. The
- *   branch-predictor hypothesis is neither supported nor refuted by this data.
- *
- *   NOMINAL's 5391 ns max is a lone outlier and the only one of its size across the
- *   four rows. Still 0.5 % of budget. Presumed scheduling/first-touch, not filter work.
+ * Results, two runs, 4 Sep 2026: design.md §8.3 / safety_filter.md. Report the 5–30 ns
+ * bracket and the ≤ 40 ns worst p99.9 — never a point value, never a named worst scenario.
  */
 
 #include <kinova_kinematics/SafetyFilter.hpp>
@@ -101,8 +48,7 @@
 namespace {
 
 // ── Configuration ────────────────────────────────────────────────────────────
-// 1e6 iterations: p99.9 over the 1e4 floor mandated by the checklist is only the
-// 10th-worst sample, which is not a stable tail. 1e6 costs a few seconds of CPU.
+// 1e6 iterations for a stable p99.9 [DESIGN].
 constexpr std::size_t kIterations = 1'000'000;
 constexpr std::size_t kWarmup     =    10'000;
 
@@ -110,7 +56,7 @@ constexpr std::size_t kWarmup     =    10'000;
 constexpr std::size_t kTableSize  = 64;
 constexpr std::size_t kTableMask  = kTableSize - 1;
 
-// Inner repetitions for the amortised-mean run (clock read cost divided by kBatch).
+// Inner repetitions for the amortised mean (clock cost divided by kBatch).
 constexpr std::size_t kBatch      = 64;
 
 constexpr double kCycleBudgetNs   = 1'000'000.0;   // 1 kHz
@@ -152,12 +98,10 @@ const char* shortName(Scenario s)
 }
 
 // ── Input construction ───────────────────────────────────────────────────────
-// Every value is derived from the bounds, never hard-coded against them, so the
-// scenarios stay valid if D-09 moves the bounds or if pos_lookahead_dt is renamed
-// to stop_horizon_s and retuned to tau.
+// Values derive from the bounds, never hard-coded, so scenarios survive D-09 and the
+// stop_horizon_s rename.
 
-/// All inputs comfortably inside every bound. jitter varies the data without
-/// changing which branches are taken.
+/// Inside every bound; jitter varies data without changing branches.
 FilterInput makeNominal(const SafetyBounds& b, double jitter)
 {
     FilterInput in;
@@ -185,9 +129,7 @@ FilterInput makeNominal(const SafetyBounds& b, double jitter)
     return in;
 }
 
-/// Every bound fires: force scaled, v_tan scaled, omega scaled, all three workspace
-/// faces refused, joint velocity scaled, and position refused on the three limited
-/// joints (2, 4, 6 — indices 1, 3, 5; the rest are continuous-rotation sentinels).
+/// Every bound fires; position refusal only on the limited joints 2, 4, 6.
 FilterInput makeAllTrip(const SafetyBounds& b, double jitter)
 {
     FilterInput in;
@@ -202,8 +144,8 @@ FilterInput makeAllTrip(const SafetyBounds& b, double jitter)
     in.twist_task(4) =  3.0 * b.omega_max * s;
     in.twist_task(5) =  3.0 * b.omega_max * s;
 
-    // Outside the upper face on all three axes, with the (post-scaling) twist still
-    // pointing outward — so this trips the directional refusal, not just the box test.
+    // Outside all three upper faces with the twist still outward: trips the
+    // directional refusal, not just the box test.
     in.ee_pos_base.x() = b.ws_x_max + 0.10;
     in.ee_pos_base.y() = b.ws_y_max + 0.10;
     in.ee_pos_base.z() = b.ws_z_max + 0.10;
@@ -212,11 +154,8 @@ FilterInput makeAllTrip(const SafetyBounds& b, double jitter)
     {
         in.qdot(j) = 3.0 * b.joint_vel_max[j] * s;      // positive: drives toward q_max
 
-        // Sitting exactly ON the upper limit means q_next exceeds it for ANY dt > 0
-        // and any surviving positive rate. Deliberately dt-independent: the scenario
-        // must not silently stop tripping when pos_lookahead_dt is retuned.
-        // Continuous joints keep their sentinel and simply never refuse — which is
-        // the true worst case, since only 3 of 7 joints CAN refuse.
+        // ON the upper limit: exceeds for any dt > 0, so dt-independent. Continuous
+        // joints keep 0.0 and never refuse (only 3 of 7 can).
         const bool limited = std::isfinite(b.joint_pos_max[j]) &&
                              b.joint_pos_max[j] < 1e8;
         in.q_send(j) = limited ? b.joint_pos_max[j] : 0.0;
@@ -224,10 +163,8 @@ FilterInput makeAllTrip(const SafetyBounds& b, double jitter)
     return in;
 }
 
-/// NaN on even entries, +inf on odd — both take the reject branch, so the branch
-/// pattern is uniform while both flavours of non-finite input get timed. inf is the
-/// one that mattered: inf > bound is TRUE, which is how phantom interventions used
-/// to reach the O3 count before the guard went in.
+/// NaN on even entries, +inf on odd: uniform branch pattern, both flavours timed.
+/// inf > bound is TRUE — the source of phantom O3 counts before the guard.
 FilterInput makeNonFinite(const SafetyBounds& b, std::size_t k)
 {
     FilterInput in = makeNominal(b, static_cast<double>(k));
@@ -283,21 +220,11 @@ struct Report
     InterventionCounter delta{};
 };
 
-/// Verify the scenario actually exercised the branches it claims to.
-///
-/// The counters are reset immediately before the timed loop (see runScenario), so the
-/// deltas belong to exactly kIterations calls — warmup and the batched run are NOT
-/// included. That makes exact counts checkable, not just their direction.
-///
-/// Two expectations are asserted EXACTLY because they encode design invariants that a
-/// refactor could silently break:
-///   - NON_FINITE must report 3 rejections per iteration, one per site. A value of N
-///     instead of 3N means a site stopped guarding its input.
-///   - ALL_TRIP / ALTERNATING must refuse joint POSITION on the three limited joints
-///     only (2, 4, 6 -> bit indices 1, 3, 5 -> mask 0b0101010 = 42). Joints 1/3/5/7
-///     are continuous-rotation sentinels and can never refuse; a mask above 42 means
-///     a sentinel was treated as a real limit.
-/// The mask is observed during warmup (untimed), so checking it costs no latency.
+/// Assert the scenario exercised the branches it claims. Counters are reset before
+/// the timed loop so deltas belong to exactly kIterations calls. Exact invariants:
+/// NON_FINITE == 3N (one reject per site; N means a site stopped guarding); mask == 42
+/// (only joints 2/4/6 refuse; above 42 means a sentinel became a limit — D-27). The
+/// mask is observed in warmup, untimed.
 bool checkCounters(Scenario         sc,
                    const InterventionCounter& d,
                    std::uint8_t     pos_mask,
@@ -354,10 +281,7 @@ Report runScenario(Scenario sc, const SafetyBounds& bounds, const std::string& p
 
     double sink = 0.0;
 
-    // Warmup: cold cache, page faults, first-touch of the sample vector.
-    // The position-refusal mask is OR-accumulated here rather than in the timed loop —
-    // observing it costs nothing because this pass is untimed, and the inputs are the
-    // same table the timed loop will cycle through.
+    // Warmup; pos mask OR-accumulated here (untimed, same input table).
     std::uint8_t pos_mask = 0;
     for (std::size_t i = 0; i < kWarmup; ++i)
     {
@@ -370,8 +294,7 @@ Report runScenario(Scenario sc, const SafetyBounds& bounds, const std::string& p
         doNotOptimize(sink);
     }
 
-    // Amortised mean: kBatch cycles between two clock reads. Removes clock overhead
-    // from the mean; says nothing about the tail.
+    // Amortised mean: kBatch cycles per clock-read pair. No clock overhead; no tail.
     double batched_ns = 0.0;
     {
         constexpr std::size_t kBatchRuns = 10'000;
@@ -397,17 +320,17 @@ Report runScenario(Scenario sc, const SafetyBounds& bounds, const std::string& p
                      static_cast<long double>(kBatchRuns * kBatch));
     }
 
-    // Counters are reset immediately before the timed run so the delta belongs to it.
+    // Reset so the delta belongs to the timed run only.
     filter.interventions().reset();
 
     std::vector<std::int64_t> samples_ns;
-    samples_ns.reserve(kIterations);          // pre-allocated: no growth while timing
+    samples_ns.reserve(kIterations);          // no growth while timing
 
     for (std::size_t i = 0; i < kIterations; ++i)
     {
         const FilterInput& in = table[i & kTableMask];
         const FilterInput* in_ptr = &in;
-        doNotOptimize(in_ptr);          // barrier on the address, not the 200-byte struct
+        doNotOptimize(in_ptr);          // barrier on the address, not the struct
 
         const auto t0 = clock::now();
         clobber();
@@ -452,7 +375,7 @@ Report runScenario(Scenario sc, const SafetyBounds& bounds, const std::string& p
             csv << i << ',' << samples_ns[i] << '\n';
     }
 
-    doNotOptimize(sink);   // sink is NaN by design in NON_FINITE; just deny elision
+    doNotOptimize(sink);   // NaN by design in NON_FINITE; deny elision only
     return rep;
 }
 
@@ -463,8 +386,8 @@ int main(int argc, char** argv)
     using clock = std::chrono::steady_clock;
     const std::string prefix = (argc > 1) ? argv[1] : "filter_latency";
 
-    // Measurement floor: two back-to-back clock reads with the same barriers as the
-    // timed region. A filter cycle may be the same order of magnitude as this.
+    // Clock floor, same barriers as the timed region. Readings conflict across runs
+    // (9 vs 13 ns) — do not cite until resolved (Step 9). A cycle is the same order.
     std::int64_t floor_min_ns = std::numeric_limits<std::int64_t>::max();
     for (std::size_t i = 0; i < 100'000; ++i)
     {
@@ -476,7 +399,7 @@ int main(int argc, char** argv)
             std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
     }
 
-    const SafetyBounds bounds;   // manifest defaults; values are D-09, still open
+    const SafetyBounds bounds;   // header defaults [DESIGN]; D-09 open, D-04 manifest pending
 
     const Scenario order[] = { Scenario::NOMINAL, Scenario::ALL_TRIP,
                                Scenario::ALTERNATING, Scenario::NON_FINITE };
@@ -492,8 +415,7 @@ int main(int argc, char** argv)
               << "  clock floor (min)   : " << floor_min_ns << " ns\n"
               << "  cycle budget        : " << kCycleBudgetNs << " ns (1 kHz)\n\n";
 
-    // Column widths are explicit: name() strings differ in length, so unpadded output
-    // does not line up and the table cannot be read at a glance or pasted into a doc.
+    // Explicit column widths so the table pastes cleanly into design.md.
     std::cout << "  " << std::left << std::setw(34) << "scenario" << std::right
               << std::setw(9)  << "mean"
               << std::setw(9)  << "batched"
@@ -517,8 +439,7 @@ int main(int argc, char** argv)
                   << '\n';
     }
 
-    // Counter deltas, printed not just asserted. A benchmark that checks an invariant
-    // silently gives you nothing to paste into design.md when the check passes.
+    // Counter deltas printed, not just asserted — the numbers go into design.md.
     std::cout << "\n  Intervention counters over the timed run (" << kIterations
               << " cycles/scenario)\n"
               << "  " << std::left << std::setw(34) << "scenario" << std::right
@@ -551,20 +472,17 @@ int main(int argc, char** argv)
               << " (one rejection per site);  ALL_TRIP/ALTERNATING mask == 42"
                  " (joints 2,4,6 only)\n";
 
-    // The reportable O3 number is the worst p99.9 across scenarios, not the nominal one.
+    // Reportable: worst p99.9 across scenarios. The printed scenario label is
+    // informational only — docs report a bound, never a named worst case.
     std::int64_t worst_p999 = 0;
-    Scenario     worst_sc   = Scenario::NOMINAL;
     bool         all_ok     = true;
     for (const Report& r : reports)
     {
-        if (r.p999_ns > worst_p999) { worst_p999 = r.p999_ns; worst_sc = r.scenario; }
+        worst_p999 = std::max(worst_p999, r.p999_ns);
         all_ok = all_ok && r.counters_ok;
     }
 
-    std::cout << "\n  worst-case p99.9    : " << worst_p999 << " ns  (" << name(worst_sc) << ")\n"
-              << "  share of 1 kHz cycle: "
-              << (100.0 * static_cast<double>(worst_p999) / kCycleBudgetNs) << " %\n"
-              << "  csv prefix          : " << prefix << "_<scenario>.csv\n";
+    std::cout << "\n  worst p99.9 (bound, scenario not named)  : " << worst_p999 << " ns\n";
 
     if (!all_ok)
     {

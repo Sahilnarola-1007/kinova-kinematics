@@ -1,8 +1,18 @@
 /**
  * @file SafetyFilter.hpp
- * @brief Three-site safety filter for the force-conditioned manipulation skill.
- *        Layer: BELOW THE CONTRACT — adapter, 1 kHz path.
- *        Architecture and design rationale: see safety_filter.md
+ * @brief Three-site engineered clipping with intervention counting (D-07).
+ *
+ * ── SafetyFilter ─────────────────────────────────────────────────────────────
+ * Layer:   Below the contract (adapter), 1 kHz path
+ * Side:    ACTION (transforms commanded quantities; never feeds back to the policy)
+ * In:      Site 1 F*n [N], tool z · Site 2 twist [m/s, rad/s] TASK frame + ee_pos [m] BASE
+ *          · Site 3 q̇ [rad/s] + q_send [rad], joint space
+ * Out:     same quantity, clipped; reason codes; per-bound counters (O3 telemetry)
+ * Frames:  Site 2 mixes a task-frame twist with a base-frame position — valid only
+ *          near axis alignment (safety_filter.md, Limitations)
+ * Fails:   non-finite input → zero output, NON_FINITE_REJECTED, counted once per site
+ * Ref:     safety_filter.md, design.md §5.6, D-04, D-09, D-27
+ * ─────────────────────────────────────────────────────────────────────────────
  *
  * @author Sahil Narola
  * @date   August 2026
@@ -65,34 +75,40 @@ struct JointFilterResult
     int num_interventions = 0;
 };
 
-// ── Bounds (from manifest, values are D-09) ──────────────────────────────────
+// ── Bounds ───────────────────────────────────────────────────────────────────
+// Header defaults [DESIGN, provisional]: final values come from the trained action
+// distribution (D-09) and will be sourced from the manifest once it exists (D-04).
 
 struct SafetyBounds
 {
-    // Site 1
-    double f_n_max   = 15.0;    ///< [N]
+    // Site 1 — tool-z desired normal force. Meaningful only with the external 6-axis
+    // wrist F/T sensor mounted and calibrated (stated precondition of the stack).
+    double f_n_max   = 15.0;    ///< [N] [DESIGN] within the 40 N Cartesian hard limit [SPEC]
 
-    // Site 2
-    double v_tan_max = 0.15;    ///< [m/s]
-    double omega_max = 0.50;    ///< [rad/s]
+    // Site 2 — task frame
+    double v_tan_max = 0.15;    ///< [m/s] [DESIGN] within the 0.5 m/s hard limit [SPEC]
+    double omega_max = 0.50;    ///< [rad/s] [DESIGN] within the 0.8727 rad/s hard limit [SPEC]
 
-    double ws_x_min = -0.5;     ///< Workspace box [m], base frame
+    double ws_x_min = -0.5;     ///< Workspace box [m], BASE frame [DESIGN]
     double ws_x_max =  0.5;
     double ws_y_min = -0.5;
     double ws_y_max =  0.5;
     double ws_z_min =  0.05;
     double ws_z_max =  0.70;
 
-    // Site 3
-    /// Per-joint velocity caps [rad/s]. [SPEC] Kortex actuator spec, verified Aug 2026.
-    /// High-level library enforces lower limits (Tables 40-41); not applied in low-level servoing.
+    // Site 3 — joint space
+    /// Per-joint velocity caps [rad/s]. [SPEC] Kortex actuator spec, Aug 2026; not confirmed
+    /// by hardware test. User Guide Tables 40-41 (high-level library) are read as not
+    /// applying in low-level servoing [UNVERIFIED by test].
     std::array<double, 7> joint_vel_max = {{
         2.0944, 2.0944, 2.0944, 2.0944,   // joints 1-4: 120 deg/s
         3.4907, 3.4907, 3.4907             // joints 5-7: 200 deg/s
     }};
 
-    /// Per-joint position limits [rad]. [SPEC] User Guide Table 39.
-    /// Joints 1,3,5,7 are continuous rotation — no position limit.
+    /// Per-joint position limits [rad]. [SPEC] Kinova Gen3 User Guide Table 39.
+    /// Joints 1,3,5,7 are continuous: sentinel ±1e9 (never refuses). D-27: differs from
+    /// the ±2π sentinel and 4th-decimal values in KinovaKinematics.cpp; the measured
+    /// pos_refused_mask == 42 invariant holds only under this sentinel.
     std::array<double, 7> joint_pos_min = {{
         -1e9, -2.2515, -1e9, -2.5800, -1e9, -2.0996, -1e9
     }};
@@ -100,7 +116,10 @@ struct SafetyBounds
          1e9,  2.2515,  1e9,  2.5800,  1e9,  2.0996,  1e9
     }};
 
-    double pos_lookahead_dt = 0.001;  ///< [s] — single step at 1 kHz
+    /// [s] single 1 kHz step [DESIGN]. The refusal bounds q_send, so servo lag cannot cause
+    /// a violation. Overshoot could — not measured; Step 3. Remedy if any: a margin ε on the
+    /// limit, not a larger dt.
+    double pos_lookahead_dt = 0.001;
 };
 
 // ── Intervention counter (O3 telemetry) ──────────────────────────────────────
@@ -137,15 +156,18 @@ class SafetyFilter
 public:
     explicit SafetyFilter(const SafetyBounds& bounds);
 
-    /// Site 1: clamp F*n. ACTION side, pre-reflex.
+    /// Site 1: scale |F*n| to f_n_max, sign preserved. ACTION, pre-reflex. [N], tool z.
     ForceFilterResult clipForce(double f_n_desired) const;
 
-    /// Site 2: clamp twist. Task frame, post-assembly. vz excluded from norms.
+    /// Site 2: post-reflex twist, TASK frame [m/s, rad/s]. α on [vx,vy], β on [wx,wy,wz];
+    /// vz excluded from both norms (the reflex owns it). Workspace refusal on all axes
+    /// uses ee_pos_base, BASE frame [m].
     CartesianFilterResult clipCartesian(
         const Eigen::Matrix<double, 6, 1>& twist_task,
         const Eigen::Vector3d& ee_pos_base) const;
 
-    /// Site 3: clamp q̇. Post-DLS. Uniform velocity scaling, position refusal.
+    /// Site 3: post-DLS q̇ [rad/s]. UNIFORM scaling (preserves Cartesian direction), then
+    /// directional single-step position refusal against q_send [rad] (commanded anchor).
     JointFilterResult clipJoint(
         const Eigen::Matrix<double, 7, 1>& qdot,
         const Eigen::Matrix<double, 7, 1>& q_send) const;
@@ -156,5 +178,5 @@ public:
 
 private:
     SafetyBounds                bounds_;
-    mutable InterventionCounter counter_;
+    mutable InterventionCounter counter_;   // mutated from const clip*; single 1 kHz thread only, not thread-safe [DESIGN]
 };
