@@ -39,11 +39,10 @@ ament_export_dependencies(Eigen3)
 ament_export_include_directories(include)
 
 # ── Manual-run tools (own main(); run by hand, NOT by `colcon test`) ──────────
-#   test_fk        : forward-kinematics sanity/smoke executable
-#   benchmark_dls  : Step 6.2 latency benchmark — run pinned + real-time
-# NOTE: if test_fk.cpp uses gtest TEST() macros rather than its own main(),
-#       remove it here and register it in the gtest block below with
-#       ament_add_gtest instead (and delete its main()).
+#   test_fk                 : FK / IK smoke check
+#   benchmark_dls           : Step 6.2 IK latency — run pinned + SCHED_FIFO
+#   benchmark_safety_filter : Step 6.4 filter latency, same protocol
+# No Kortex dependency anywhere in this package: USE_KORTEX_MOCK is not read here.
 
 add_executable(test_fk tests/test_fk.cpp)
 target_link_libraries(test_fk kinova_kinematics)

@@ -1,248 +1,276 @@
-# kinova_kinematics — Design Document
+# design.md — kinova_kinematics
 
-**Scope.** Forward kinematics, the geometric Jacobian, the iterative pose solver, and the
-differential inverse kinematics used inside the 1 kHz control loop (Phase 0, Step 6).
+Engineering record for the kinematics-and-clipping stage of the Idea 5 adapter. The README is
+for deciding whether to care; this file is for the reader who has decided.
 
-**Status.** FK, Jacobian, `solveIK`, `solveDLS` and `jointVelocityDLS` are implemented. FK,
-Jacobian and `solveIK` pass analytic checks at the home configuration (z = 1.1873 m; symmetry
-checks pass); the **hardware FK-vs-Kortex comparison is pending the tool-offset check (D-14,
-22 Aug)**. The differential path (`jointVelocityDLS` / `solveDLS`) is unit-tested and
-latency-benchmarked (Step 6.2, §9).
-
-**Convention.** Classical Denavit–Hartenberg, 8 frames (rows 0–7), radians throughout. The
-public API takes and returns radians; the deg↔rad seams are owned by the 1 kHz loop (D-25).
+Provenance tags used throughout: `[MEASURED]` on this hardware / lab PC, run identified ·
+`[COMPUTED]` from this library's own code or an independent reimplementation, no hardware ·
+`[DERIVED]` reproducible by hand from a stated formula · `[SPEC]` vendor document ·
+`[DESIGN]` a project decision · `[INFERRED]` a model that fits observed behaviour ·
+`[UNVERIFIED]` believed, not checked — with what would check it.
 
 ---
 
-## 1. Where this library sits
+## 1 · Scope and layer
 
-The pipeline has two independent paths through this library. They must not share code.
+**Layer.** Below the contract (adapter), 1 kHz path. Knows the robot; rewritten per port.
 
-```mermaid
-flowchart TD
-    subgraph OBS["OBSERVATION PATH (measured, flows up)"]
-        A[Joint feedback q_meas, 1 kHz] --> B[computeFK]
-        B --> C[EE position 3 + 6D rotation 6]
-        C --> D[Observation builder → 38/39-element vector, width open D-01]
-    end
+**In scope.** Forward kinematics (observation side), numerical Jacobian and damped-least-squares
+differential IK (action side), a Yoshikawa singularity monitor, an offline iterative pose solver,
+and the three-site safety filter with intervention counting.
 
-    subgraph ACT["ACTION PATH (commanded, flows down)"]
-        E[Policy action: F*n, vx, vy, wx, wy, wz] --> F[Admittance reflex → vz]
-        F --> G[Assemble 6-vector twist, TASK frame]
-        G --> H[Caller rotates task → base]
-        H --> I[jointVelocityDLS → q_dot, rad/s]
-        I --> J[SafetyFilter: uniform scale, limits]
-        J --> K[q_send += q_dot·dt, commanded-anchor]
-        K --> L[Refresh, 1 kHz]
-    end
+**Out of scope, on purpose.** Task→base rotation, integration into `q_send`, the admittance
+reflex, the 1 kHz cyclic loop and its watchdog (all `kinova-wrapper` / `admittance-controller`).
+Perception is out of scope for the whole portability argument: the socket is a fixed fixture and
+lateral error is injected in software at reset.
 
-    A -.-> I
-```
+**Convention.** Classical Denavit–Hartenberg, 8 frames (rows 0–7), radians throughout
+`[MEASURED — convention confirmed by FK checks, §8.1]`. The public API takes and returns radians;
+the deg↔rad seam is owned by the 1 kHz loop (D-25).
 
-`computeFK` serves the **observation** side. `jointVelocityDLS` serves the **action** side.
-`computeJacobian` is called on the action side only, evaluated at the measured `q_meas`.
-
-**`solveIK` is not used in the 1 kHz loop.** It is an iterative *pose* solver — it takes a
-target pose and iterates to convergence. The loop needs a single-shot *velocity* solve at a
-fixed 1 ms budget. In particular, the error-proportional damping heuristic inside `solveIK`
-(`lambda = 0.5 * de.norm() + 1e-4`) is meaningful only when there is a pose error to be
-proportional to. In a differential solve there is no pose error, so that heuristic must not
-be carried over. `solveIK` remains for offline planning and test fixtures.
+**Idea 5 goal, current wording.** One frozen force-conditioned policy performs a connector
+insertion across kinematically different cobots driven through position/velocity interfaces.
+Real validation on a Gen3 7-DOF; cross-body evidence primarily in MuJoCo, with a Gen3 6-DOF in
+the lab as a stretch objective; zero target-robot data, zero gradient steps on the policy. The
+claim is **architectural portability**, not hardware-agnosticism. Every target arm requires a
+mounted, calibrated 6-axis wrist F/T sensor — a stated precondition, not an accessory.
 
 ---
 
-## 2. Components
+## 2 · Requirements
 
-| Function | Returns | Units | Notes |
+| ID | Requirement | Definition of done | Status |
 |---|---|---|---|
-| `computeFK(q)` | `Matrix4d` | m, base frame | Classical DH chain, 8 frames, incl. 0.113 m tool z-offset |
-| `getPosition(T)` | `Vector3d` | m, base | Translation block |
-| `getRotation(T)` | `Matrix3d` | — | Rotation block; first two columns are the 6D observation |
-| `computeJacobian(q)` | `Matrix<double,6,7>` | see §4 | Geometric, numerical forward difference, step `eps = 1e-6`, fixed size |
-| `solveDLS(J, twist, λ)` | `DlsResult` | see §4 | Linear-algebra core; **public** dependency-injection / test seam (D-26) |
-| `jointVelocityDLS(q, twist, λ)` | `DlsResult` | see §4 | 1 kHz entry point; builds `J` internally, then calls `solveDLS` |
-| `solveIK(...)` | `IKResult` | m, rad | Iterative LM + null-space joint-limit term. **Offline only.** |
-| `jointLimitGradient(q)` | `VectorXd 7` | — | Secondary objective for `solveIK` |
-
-The Jacobian is computed numerically by finite difference rather than analytically. This is
-adequate for the 1 kHz budget (see §9) but it is a numerical approximation, and the choice of
-`eps` trades truncation error against floating-point cancellation. It is a candidate for
-replacement by an analytic Jacobian if later benchmarking shows a timing problem.
+| R1 | FK of the tool tip in the base frame from 7 joint angles | Analytic checks at q = 0 and ±0.3 rad symmetry pass; hardware FK-vs-Kortex comparison recorded with the D-14 offset accounted for | Off-robot checks pass `[COMPUTED]`; hardware pending (Step 3) |
+| R2 | Single-shot differential IK inside the 1 ms cycle | p99.9 ≤ 10 % of budget under SCHED_FIFO + pinned core, N ≥ 10⁶ | **Met**: p99.9 = 3.04 µs `[MEASURED]` (§8.2) |
+| R3 | Bounded joint-velocity amplification near singularity | Derived bound BOUND-1 (§5.3) holds in tests at every λ/σ pair and on real Jacobians | **Met** (`test_dls.cpp`) |
+| R4 | Fail-safe on non-finite input | Any NaN/inf in q, J, twist, λ ⇒ `ok = false`, `qdot` exactly zero, at every guard | **Met** (`test_dls.cpp`, `test_safety_filter.cpp`) |
+| R5 | Three-site clipping with per-bound intervention counts (O3) | Each bound fires in isolation and is counted once; NOMINAL inputs never fire; non-finite is counted per site | **Met** (28 tests; benchmark self-checks) |
+| R6 | Builds and tests with no robot and no vendor SDK | `colcon build` + `colcon test` on a machine with only Eigen3 | **Met** |
+| R7 | Filter cost never a reason to weaken a bound | Worst p99.9 ≤ 1 % of budget | **Met**: ≤ 40 ns `[MEASURED]` (§8.3) |
 
 ---
 
-## 3. The differential problem
-
-**Given** a desired end-effector twist `v` in the **base** frame, and the current measured
-joint configuration `q_meas`, **find** joint velocities `q_dot` such that `J(q) · q_dot ≈ v`.
-
-For the Gen3, `J` is **6×7**. Six equations, seven unknowns: the system is
-**underdetermined**, not overdetermined. There is an infinite family of exact solutions and
-the question is which one to pick, not how to best approximate an unreachable one.
-
-This matters because it selects the formulation. The correct object is the **minimum-norm**
-solution — the `q_dot` of smallest magnitude that achieves the twist:
+## 3 · Data flow
 
 ```
-q_dot = Jᵀ (J Jᵀ)⁻¹ v          (minimum-norm pseudoinverse, right inverse)
+  OBSERVATION SIDE (measured, flows up)        ACTION SIDE (commanded, flows down)
+  ─────────────────────────────────────        ──────────────────────────────────────────────
+  BaseCyclic feedback, 1 kHz                   policy action [F*n, vx, vy, wx, wy, wz]  (~30 Hz)
+     │ q_meas [deg] → [rad]  (loop, D-25)          │ F*n tool-z [N]; motion in TASK frame
+     ▼                                              ▼
+  computeFK(q_meas) ─► T_base [m]              SafetyFilter Site 1  clipForce(F*n)         THIS PKG
+     │                                              ▼
+     ├─ getPosition → p_base [m]               admittance reflex (PI on −fz) → vz         (external)
+     └─ getRotation → R, cols 0–1 = 6D obs          ▼
+        NO Gram-Schmidt: nothing is ever       assemble twist_task [vx vy vz wx wy wz]
+        reconstructed from the 6D vector            ▼
+     │                                         SafetyFilter Site 2  clipCartesian(twist_task,
+     ▼                                              │                            p_base)    THIS PKG
+  task-frame pose / velocity built by              ▼  vz excluded from the scaling norms
+  the loop from T_base and the latched          caller rotates task → base (rotation only)
+  task frame  (kinova-wrapper)                      ▼
+     │                                         jointVelocityDLS(q_meas, twist_base, λ)      THIS PKG
+     ▼                                              │  J at MEASURED q; (JJᵀ+λ²I) LDLᵀ; q̇ = Jᵀy
+  ObservationPublisher, 30 Hz                       ▼  q̇ [rad/s]
+  obs = 38 (v1, pending D-01 —                 SafetyFilter Site 3  clipJoint(q̇, q_send)   THIS PKG
+        39 if recovery phase adopted)               │  uniform scale; single-step position refusal
+                                                    ▼  q̇_safe
+                                               q_send = q_send_prev + q̇_safe·dt  (commanded anchor, P19)
+                                                    ▼
+                                               Refresh() → arm   (kinova-wrapper)
+
+  Dotted dependency: q_meas (OBS) is also the point at which J is evaluated (ACTION). It is the
+  only quantity that crosses sides, and it crosses as an input, never as a policy observation.
 ```
 
-The least-squares form `(Jᵀ J)⁻¹ Jᵀ` is for the overdetermined case and is wrong here —
-`Jᵀ J` is 7×7 and singular by construction for a 6×7 Jacobian.
+`solveIK` is not on either path. It is an iterative *pose* solver for offline planning and
+test fixtures; its error-proportional damping (`λ = 0.5·‖e‖ + 1e-4`) is meaningful only when
+there is a pose error, so it must never be carried into the differential solve.
 
 ---
 
-## 4. Units and frames — stated before anything else
+## 4 · Interfaces
 
-| Quantity | Symbol | Units | Frame |
-|---|---|---|---|
-| Input twist, linear rows 0–2 | `v_lin` | m/s | **base** |
-| Input twist, angular rows 3–5 | `v_ang` | rad/s | **base** |
-| Joint configuration | `q` | rad | joint space, order 1..7 |
-| Output joint velocity | `q_dot` | **rad/s** | joint space, order 1..7 |
-| Jacobian rows 0–2 | — | m/rad | — |
-| Jacobian rows 3–5 | — | dimensionless | — |
+Authoritative frames and units. A frame or unit error is the most expensive class of bug in
+this project.
 
-**Two unit boundaries the caller owns, both of which are known bug sources:**
+| Function | Side | Input | Output | Frame | Units |
+|---|---|---|---|---|---|
+| `computeFK(q)` | OBS | `array<double,7>` | `Matrix4d` T | T in **base**, includes tool offset along the final frame's local z | rad → m |
+| `getPosition(T)` / `getRotation(T)` | OBS | `Matrix4d` | `Vector3d` / `Matrix3d` | base | m / — |
+| `computeJacobian(q)` | ACTION | `array<double,7>` | `Matrix<6,7>` | base | rows 0–2 m/rad; rows 3–5 dimensionless |
+| `jointVelocityDLS(q_meas, twist, λ)` | ACTION | q [rad]; twist **base**, rows 0–2 [m/s], 3–5 [rad/s]; λ > 0 | `DlsResult` | q̇ joint space, order 1..7 | rad/s |
+| `solveDLS(J, twist, λ)` | ACTION | J, twist, λ | `DlsResult` | as above | as above — public test seam (D-26) |
+| `manipulability(J)` | monitor | `Matrix<6,7>` | `double` w ≥ 0, NaN if J non-finite | — | mixed (§5.3.4) |
+| `solveIK(pose, guess, iters, tol_p, tol_o)` | offline | `Matrix4d` base, guess [rad] | `IKResult` | base | m, rad |
+| `SafetyFilter::clipForce(F*n)` | ACTION, Site 1 | `double` | `ForceFilterResult` | tool z | N |
+| `SafetyFilter::clipCartesian(twist_task, p_base)` | ACTION, Site 2 | `Matrix<6,1>`, `Vector3d` | `CartesianFilterResult` | twist **task**, position **base** | m/s, rad/s; m |
+| `SafetyFilter::clipJoint(q̇, q_send)` | ACTION, Site 3 | `Matrix<7,1>` ×2 | `JointFilterResult` | joint space | rad/s; rad |
 
-1. **Task frame → base frame.** The policy action and the admittance reflex work in the
-   *task* frame (latched at CONTACT entry). `jointVelocityDLS` takes a **base-frame** twist.
-   The rotation is the caller's responsibility, deliberately — see §7. Apply a
-   **rotation only**, never the full 4×4 homogeneous transform: a twist is a vector pair,
-   not a point, and applying the translation leaks a phantom offset.
-
-2. **rad/s → deg/s.** This function returns **rad/s**. The 1 kHz loop integrates into
-   `q_send`, which is in **degrees** (Kortex `feedback.actuators(i).position()` is degrees).
-   The conversion must happen at the integration step:
-   `q_send_deg += q_dot_rad_s * (180/π) * dt`. Omitting it produces motion that is
-   57× too slow and looks exactly like a damping problem.
-
----
-
-## 5. Why damping, and how λ is chosen
-
-### 5.1 The failure the damping fixes
-
-Write the pseudoinverse in terms of the singular values of `J`. Each singular direction is
-scaled by `1/σ`. As the arm approaches a singularity some `σ → 0`, so `1/σ → ∞`, and a small
-commanded twist in that direction demands an unbounded joint velocity. On hardware that is a
-violent, uncommanded motion.
-
-Damped least squares replaces the per-direction gain:
-
-```
-1/σ        →        σ / (σ² + λ²)
+```cpp
+struct DlsResult {
+    Eigen::Matrix<double,7,1> qdot;            // [rad/s], joints 1..7; zero on failure
+    Eigen::Matrix<double,6,1> twist_achieved;  // J·qdot, BASE [m/s; rad/s]; differs from the
+                                               // command by the damping residual
+    double lambda_used;                        // NaN until a solve ran (mixed units, §5.3.3)
+    double manipulability;                     // NaN by design (D-20) — never computed here
+    bool   ok;                                 // false ⇒ qdot is zero; do not command
+};
 ```
 
-As `σ → 0` the damped gain also goes to **zero** rather than to infinity. The solve stops
-trying to move in directions the arm cannot move in, instead of trying infinitely hard.
+**Two unit boundaries the caller owns, both known bug sources:**
 
-The damped minimum-norm solution is:
+1. **Task → base.** The policy and the reflex work in the task frame (latched at CONTACT entry).
+   `jointVelocityDLS` takes a base-frame twist. Apply a **rotation only**, never the 4×4
+   homogeneous transform: a twist is a vector pair, not a point, and applying the translation
+   leaks a phantom offset.
+2. **rad/s → deg/s.** The loop integrates into `q_send`, which is in degrees (Kortex
+   `feedback.actuators(i).position()` is degrees `[SPEC]`). Convert at the integration step:
+   `q_send_deg += q̇_rad_s · (180/π) · dt`. Omitting it produces motion 57× too slow that looks
+   exactly like a damping problem.
 
-```
-q_dot = Jᵀ (J Jᵀ + λ² I₆)⁻¹ v
-```
+**Not this library's job — and where it lives**
 
-### 5.2 The worst-case velocity bound
-
-Let `g(σ) = σ / (σ² + λ²)`. Then
-
-```
-g'(σ) = (λ² − σ²) / (σ² + λ²)²
-```
-
-which is zero at `σ = λ`, giving the maximum
-
-```
-g_max = λ / (2λ²) = 1 / (2λ)
-```
-
-Therefore, for any commanded twist:
-
-```
-‖q_dot‖  ≤  ‖v‖ / (2λ)                                            (BOUND-1)
-```
-
-This is exact, derived, and is the number the SafetyFilter's clamp threshold is set from.
-It is worst-case: it is attained only when the commanded twist aligns with a singular
-direction whose singular value happens to equal λ.
-
-### 5.3 Choosing λ — the tension, stated honestly
-
-A single constant λ cannot satisfy both requirements at once:
-
-| λ | Behaviour near singularity | Behaviour in normal operation |
+| Excluded | Why | Owner |
 |---|---|---|
-| Large (e.g. 0.29) | Tight velocity bound, safe | Heavily damped. At the measured σ = 0.297 (§5.4.1) 49 % of the commanded velocity is lost; at the worst σ measured at that pose, 0.152, the loss is 78 % |
-| Small (e.g. 0.05) | BOUND-1 gives ‖q_dot‖ ≤ 10·‖v‖ — too loose to rely on | Accurate tracking |
+| Velocity clamping inside DLS | Would distort the twist direction and hide it from the one auditable safety layer | SafetyFilter Site 3 |
+| Null-space projection | A secondary objective changes q̇ for reasons unrelated to the command and makes the λ sweep uninterpretable | Deferred, post-Phase-0 |
+| Task→base rotation | Would give this library a dependency on task state | 1 kHz loop |
+| Integration to position | `q_send` is the loop's integrator state; the library must be stateless w.r.t. the loop | 1 kHz loop |
+| Joint-limit checking inside DLS | Same as clamping: one auditable layer | SafetyFilter Site 3 |
 
-This is a known property of constant-λ DLS, not a defect in this design. The literature
-answer is variable damping (λ raised only as `σ_min` falls), which requires `σ_min` every
-cycle — an SVD, which is not affordable inside a 1 ms budget alongside the Jacobian.
+---
 
-**Decision.** λ is held small and constant for tracking quality. The velocity bound is
-enforced **downstream in the SafetyFilter**, not inside this function. BOUND-1 is what makes
-the filter's clamp threshold defensible rather than arbitrary. The caller can compute a
-`manipulability` metric (§8) to observe proximity to singularity and act on it.
+## 5 · Algorithms
 
-**Provisional value: λ = 0.05.** This is a starting point, not a result. It is replaced by
-the outcome of the 6.4 sweep (§9), which measures, at each λ:
+Each subsection answers: inputs/outputs with frames and units; why this and not the obvious
+alternative; how it fails; what number proves it and where that number was measured.
 
-- twist residual `‖J·q_dot − v‖` at a nominal, well-conditioned configuration
-- peak `‖q_dot‖` at a deliberately near-singular configuration
-- whether the measured peak respects BOUND-1
+### 5.1 Forward kinematics
 
-**λ is a per-call parameter** to `solveDLS` / `jointVelocityDLS`, so the sweep passes a
-different value per run with no recompile. It is validated inside `solveDLS`:
-`!(lambda > 0.0) || !std::isfinite(lambda)` rejects zero, negative, NaN and ±∞ (returns
-`ok = false`, `qdot` zeroed).
+**In/out.** q [rad] → T ∈ SE(3), base frame, metres. Classical DH,
+`T_i = Rot_z(θ)·Trans_z(d)·Trans_x(a)·Rot_x(α)`, row 0 is the fixed base frame, rows 1–7 carry
+joint angles plus offsets, then a pure translation `tool_offset_z` along the final frame's local z.
 
-**λ must be strictly positive.** At λ = 0 the damping vanishes and `J Jᵀ` may be singular,
-so the LDLᵀ factorisation in §6 is no longer guaranteed.
+| Frame | α | a | d [m] | θ offset |
+|---|---|---|---|---|
+| 0 (base) | π | 0 | 0 | 0 |
+| 1 | π/2 | 0 | −0.2848 | 0 |
+| 2 | π/2 | 0 | −0.0118 | π |
+| 3 | π/2 | 0 | −0.4208 | π |
+| 4 | π/2 | 0 | −0.0128 | π |
+| 5 | π/2 | 0 | −0.3143 | π |
+| 6 | π/2 | 0 | 0 | π |
+| 7 | π | 0 | −0.1674 | π |
+| tool | — | — | +0.113 along local z | — |
 
-### 5.4 The mixed-units defect — stated, not hidden
+Link lengths `[SPEC — Kinova Gen3 7-DOF kinematic parameters; Sahil to record the exact User
+Guide table/figure reference]`. Convention `[MEASURED]`: classical DH reproduces flange
+z = 1.1873 m at q = 0 and passes symmetry checks (§8.1). Tool offset `[MEASURED]` 0.113 m
+flange-to-tip for the current test handle (D-14); a constructor parameter, not a literal.
 
-`λ² I₆` adds the *same scalar* to all six diagonal entries of `J Jᵀ`. But `J Jᵀ` does not have
-uniform units. With linear Jacobian rows in m/rad and angular rows dimensionless, the blocks
-of `J Jᵀ` carry units of m²/rad², m/rad, and 1 respectively. A single scalar λ is therefore
-**dimensionally inconsistent** across the linear and angular parts of the system.
+**Why classical, not modified DH.** Empirical: the classical chain matched the Kortex-reported
+pose in the earlier high-level phase and the modified chain did not `[MEASURED, D-series entry —
+run not identified here; see design_decisions.md]`.
 
-The practical consequence: the *effective* damping applied to translation and to rotation
-differs by roughly the square of a characteristic length. A λ tuned for good translational
-behaviour is not the λ that is right for rotation.
+**Fails when** a joint angle is non-finite (propagates to every element of T — caught upstream
+in `jointVelocityDLS`, not in `computeFK`), or when the DH table is transcribed in degrees.
 
-**This is a real defect and it is not fixed in v1.** It is recorded here so that it is not
-later mistaken for a tuning problem.
+**Number.** z = 1.1873 m at q = 0 `[COMPUTED]`. Hardware comparison pending; it will carry ~7 mm
+by construction (Kortex configured 0.12 m vs measured 0.113 m).
 
-*Proposal, NOT in the locked scope, flagged as scope creep and deferred to 6.5:* pre-multiply
-the twist and the Jacobian by a diagonal weight `W = diag(1/L, 1/L, 1/L, 1, 1, 1)` with `L` a
-characteristic arm length (order 0.5 m). This makes both blocks dimensionless and λ
-dimensionally consistent. It changes the meaning of λ, so it must not be introduced silently
-mid-sweep. Decide after the λ sweep, not during it.
+### 5.2 Jacobian — numerical
 
-The same wart applies to the Yoshikawa manipulability measure in §8.
+**In/out.** q [rad] → J ∈ ℝ^{6×7}, base frame; rows 0–2 [m/rad], rows 3–5 dimensionless.
+Forward finite difference, `eps = 1e-6` rad `[DESIGN]`: 8 DH-chain evaluations per call, linear
+part `(p₁ − p₀)/eps`, angular part the vee of `R₁R₀ᵀ` divided by `2·eps`.
 
-*This is not an idiosyncratic worry.* Dimensional inhomogeneity of the Jacobian is a known
-obstacle to using the condition number as a measure of invertibility, and the "characteristic
-length" was introduced in the literature specifically to cope with it. Several selection
-criteria for that length exist (minimising the condition number; scaling by maximum desired
-forces). **References unverified — read the primary sources before citing.**
+**Why numerical.** It is fast enough — the whole `jointVelocityDLS` call is 1.90 µs mean
+`[MEASURED]` — and it cannot disagree with the FK it is derived from. An analytic Jacobian is the
+fallback only if a timing problem appears; none has.
 
-### 5.4.1 λ is robot-specific — measured
+**Fails when** `eps` is too small (cancellation) or too large (truncation) — 1e-6 is a
+conventional middle `[DESIGN, not swept]`; and when q is non-finite.
 
-λ is a threshold on σ: the gain `g(σ) = σ/(σ²+λ²)` peaks at `σ = λ` (§5.2). λ is therefore
-only meaningful relative to the σ spectrum of *this* arm, and that spectrum depends on the
-arm's geometry.
+**Number.** Analytic `Jv` vs central finite difference agree to 1.4e-10 at a random non-singular
+pose `[COMPUTED — independent Python reimplementation, Sep 2026; not yet reproduced from
+`computeJacobian` in C++]`.
 
-**σ has no consistent unit.** It is a ratio of task-space output to joint rate. For a
-translation-dominated singular direction that is m/rad; for a rotation-dominated one it is
-dimensionless; for a mixed direction it is neither. λ is compared against σ, so λ has no
-consistent unit either. This is the §5.4 defect restated in the form that matters for tuning.
+### 5.3 Damped least-squares differential IK
 
-**Measured spectrum at `kHomeRad`** (`test_dls.cpp:122`, tool offset 0.113 m, reach 0.716 m).
-`u` is the left singular vector — the task-space direction that mode produces. "% linear" is
-`‖u_v‖²`, the translational share of that direction's energy. "Lost" is `λ²/(σ²+λ²)`, the
-fraction of commanded task velocity discarded by damping.
+#### 5.3.1 The problem
+
+**In/out.** twist v (base, [m/s; rad/s]) and measured q_meas [rad] → q̇ [rad/s] with
+`J(q_meas)·q̇ ≈ v`. J is 6×7: six equations, seven unknowns — **underdetermined**. There is an
+infinite family of exact solutions; the question is which one, not how to approximate an
+unreachable one. The right object is the minimum-norm solution `q̇ = Jᵀ(JJᵀ)⁻¹v`. The
+least-squares form `(JᵀJ)⁻¹Jᵀ` is for the overdetermined case and is wrong here — `JᵀJ` is 7×7
+and singular by construction.
+
+#### 5.3.2 Why damping, and the derived bound
+
+Each singular direction of the pseudoinverse is scaled by `1/σ`; near a singularity `σ → 0` and
+a small commanded twist demands unbounded joint velocity — on hardware, a violent uncommanded
+motion. Damping replaces the gain:
+
+```
+1/σ  →  g(σ) = σ / (σ² + λ²)          q̇ = Jᵀ (J Jᵀ + λ² I₆)⁻¹ v
+```
+
+`g → 0` as `σ → 0`: the solve stops trying to move in directions the arm cannot move in.
+
+**BOUND-1** `[DERIVED]`. `g'(σ) = (λ² − σ²)/(σ² + λ²)²` is zero at `σ = λ`, giving
+`g_max = 1/(2λ)`. Hence for any commanded twist
+
+```
+‖q̇‖ ≤ ‖v‖ / (2λ)                                                (BOUND-1)
+```
+
+Exact and reproducible by hand. Attained only when the twist aligns with a singular direction
+whose σ equals λ. This is the number that makes Site 3's clamp threshold defensible rather than
+arbitrary. Tests: `AmplificationCeilingIsAttainedWhenSigmaEqualsLambda` (tight),
+`NeverExceedsTheAmplificationCeiling` (upper bound over λ × σ grid),
+`RespectsTheAmplificationCeilingAcrossConfigurations` (real Jacobians).
+
+#### 5.3.3 Choosing λ — the tension, and the mixed-units defect
+
+A single constant λ cannot satisfy both requirements at once `[DERIVED]`:
+
+| λ | Near singularity | Normal operation |
+|---|---|---|
+| Large (0.29) | Tight bound, safe | Heavy loss: 49 % at σ = 0.297, 78 % at σ = 0.152 (§5.3.4) |
+| Small (0.05) | BOUND-1 gives ‖q̇‖ ≤ 10·‖v‖ — too loose to rely on alone | Accurate tracking |
+
+The literature answer is variable damping keyed to σ_min, which needs an SVD every cycle —
+not measured, and a different, more expensive operation than the LDLᵀ solve.
+
+**Decision `[DESIGN]`.** λ is held small and constant for tracking; the velocity bound is
+enforced downstream at Site 3. **Provisional λ = 0.05** — a starting point, replaced by the λ
+sweep (§7 item 7). λ is a per-call parameter, validated inside `solveDLS`
+(`!(λ > 0) || !isfinite(λ)` rejects 0, negative, NaN, ±∞). λ must be strictly positive: at
+λ = 0, `JJᵀ` may be exactly singular and the factorisation is no longer guaranteed.
+
+**Mixed units — a real defect, not fixed in v1.** `λ²I₆` adds the same scalar to all six
+diagonal entries of `JJᵀ`, but the blocks of `JJᵀ` carry units m²/rad², m/rad and 1. The
+effective damping on translation and on rotation differs by roughly the square of a
+characteristic length; a λ tuned for translation is not the λ for rotation. Recorded so it is
+never mistaken for a tuning problem. *Proposal, not in locked scope, deferred to 6.5:*
+pre-multiply twist and J by `W = diag(1/L,1/L,1/L,1,1,1)`, L a characteristic arm length
+(order 0.5 m). It changes the meaning of λ; decide after the sweep, never during it.
+Dimensional inhomogeneity of the Jacobian and the "characteristic length" remedy are known in
+the literature `[UNVERIFIED — Sahil must check primary sources before citing]`.
+
+#### 5.3.4 λ is robot-specific — measured spectrum and link-scale sensitivity
+
+λ is a threshold on σ, and the σ spectrum depends on the arm's geometry. σ has no consistent
+unit (m/rad for translation-dominated directions, dimensionless for rotation-dominated), so
+neither does λ — the §5.3.3 defect in the form that matters for tuning.
+
+**Spectrum at `kHomeRad`** (the `test_dls.cpp` fixture; tool offset 0.113 m; reach 0.716 m)
+`[COMPUTED — independent Python reimplementation of the DH table, Sep 2026; cross-checked by FK
+z = 1.1873 at q = 0 and Jv agreement 1.4e-10; NOT yet reproduced from `computeJacobian`]`.
+"% linear" = ‖u_v‖², the translational share of that direction; "lost" = λ²/(σ²+λ²).
 
 | σ | % linear | lost at λ = 0.05 | lost at λ = 0.29 |
 |---|---|---|---|
@@ -253,364 +281,305 @@ fraction of commanded task velocity discarded by damping.
 | 0.180 | 84 | 7.1 % | 72 % |
 | 0.152 | 80 | 9.7 % | 78 % |
 
-Two readings:
+Damping engages on translation, not rotation, at this pose. `kHomeRad` is not the worst pose
+seen — σ ≈ 0.105 has been observed at an ordinary pose `[COMPUTED, pose not recorded — record
+it before citing]`.
 
-- **Damping engages on translation, not rotation**, at this pose. The three rotation-dominated
-  modes lose under 0.3 % at λ = 0.05. This is the §5.4 defect in measured form.
-- §5.3's "typical σ ≈ 0.3" was optimistic: 0.297 is the *largest* of the three small values
-  here. `kHomeRad` is also not the worst pose observed — §12 records σ ≈ 0.105 elsewhere.
+**Link-scale sensitivity** — same solver, same λ, same joint configuration; only the DH `d`
+values and the tool offset scaled by k `[COMPUTED, same provenance]`:
 
-#### Link-scale sensitivity — why λ does not transfer
-
-Same solver, same λ, geometrically similar arm of a different size. Joint configuration is
-**identical in every row** (`kHomeRad`); only the DH `d` values and the tool offset are
-multiplied by the link scale factor k.
-
-| Link scale factor k (all link lengths × this; k=1 is the real Gen3) | Tool reach ‖p‖ [m] | σ_min of the full 6×7 Jacobian | σ_min(k) ÷ σ_min(k=1) — how much σ_min actually shrank | k, for comparison — how much it *would* shrink if all of J scaled | Translational share ‖u_v‖² of that direction [%] | Rotational share ‖u_ω‖² [%] | Velocity lost along that direction at λ = 0.05 |
+| k (k = 1 is the Gen3) | reach [m] | σ_min | σ_min(k)/σ_min(1) | k | linear share | rot share | lost at λ = 0.05 |
 |---|---|---|---|---|---|---|---|
-| 1.0 | 0.716 | 0.1519 | 1.0000 | 1.0000 | 80.1 | 19.9 | 9.8 % |
-| 0.5 | 0.358 | 0.0823 | 0.5418 | 0.5000 | 94.2 | 5.8 | 27.0 % |
-| 0.1 | 0.072 | 0.0169 | 0.1113 | 0.1000 | 99.8 | 0.2 | 89.7 % |
+| 1.0 | 0.716 | 0.1519 | 1.0000 | 1.0000 | 80.1 % | 19.9 % | 9.8 % |
+| 0.5 | 0.358 | 0.0823 | 0.5418 | 0.5000 | 94.2 % | 5.8 % | 27.0 % |
+| 0.1 | 0.072 | 0.0169 | 0.1113 | 0.1000 | 99.8 % | 0.2 % | 89.7 % |
 
-Three findings:
+1. σ_min shrinks with the arm but not proportionally: scaling scales `Jv` by k and leaves `Jω`
+   alone. "σ scales with link length" is false as a flat statement.
+2. The singular direction re-orients toward pure translation. No closed-form correction; the SVD
+   must be recomputed, not rescaled.
+3. A fixed λ becomes destructive on a smaller arm: 9.8 % loss on the Gen3 becomes 89.7 % at
+   tenth scale, at the same, non-singular configuration.
 
-1. **σ_min shrinks with the arm, but not proportionally.** Columns 4 and 5 disagree: 0.1113
-   against 0.1000. Scaling the arm scales `Jv` by k and leaves `Jw` untouched, so only half
-   the matrix moves. "σ scales with link length" is *false* as a flat statement — only
-   translation-dominated σ scale, and only approximately.
-2. **The singular direction re-orients.** Column 6 runs 80.1 → 94.2 → 99.8 %. As `Jv` shrinks,
-   the worst direction becomes almost purely translational. No closed-form correction factor
-   exists; the SVD must be recomputed, not rescaled.
-3. **A fixed λ becomes destructive on a smaller arm.** The λ = 0.05 that costs 9.8 % on the
-   Gen3 costs 89.7 % on a tenth-scale arm at the *same* joint configuration — a configuration
-   nowhere near a kinematic singularity.
-
-λ lives in the adapter, below the interface contract. A per-robot λ therefore does not weaken
-the architectural-portability claim; it is exactly the kind of robot-specific quantity the
+λ lives in the adapter, below the contract. A per-robot λ does not weaken the
+architectural-portability claim — it is exactly the kind of robot-specific quantity the
 contract exists to keep below the boundary.
 
-#### Procedure for a new robot
+**Procedure for a new robot** `[DERIVED from BOUND-1]`:
+1. Measure the spectrum over poses the arm will visit; record the smallest
+   translation-dominated σ.
+2. Upper bound from accuracy: for tolerable loss L, `λ ≤ σ·sqrt(L/(1−L))`. Gen3: σ = 0.152,
+   L = 10 % → λ ≤ 0.0507 — reproduces the shipped 0.05.
+3. Lower bound from the velocity cap, *only if damping is the sole limiter*:
+   `λ ≥ ‖v‖_max / (2·q̇_cap)`. Gen3: 0.559/(2·2.094) = 0.133.
+4. Verify by sweep on the new arm.
 
-Derived from §5.2, not taken from the literature.
+Steps 2 and 3 are incompatible on the Gen3 (0.05 < 0.133) — deliberately. λ = 0.05 permits
+‖q̇‖ ≤ 5.59 rad/s against a 2.094 rad/s cap, which is why Site 3 fires in normal operation
+(‖q̇‖ = 3.39 rad/s observed at mid-workspace poses `[COMPUTED — pose not recorded]`) rather than
+acting as last resort. **λ buys accuracy; Site 3 enforces the cap.**
 
-1. **Measure the spectrum.** Sample poses the arm will actually visit, compute J, take the
-   SVD, record the distribution of the smallest translation-dominated σ.
-2. **Upper bound, from accuracy.** For a tolerable fractional velocity loss L:
-   `λ ≤ σ · sqrt(L / (1 − L))`. Gen3 check: σ = 0.152, L = 10 % → λ ≤ 0.0507. This reproduces
-   the shipped 0.05 and its 9.7 % loss.
-3. **Lower bound, from the velocity cap** — *only if damping is the sole limiter.* From
-   BOUND-1, `‖q̇‖ ≤ ‖v‖/(2λ)`, so `λ ≥ ‖v‖_max / (2·q̇_cap)`. Gen3 check:
-   0.559 / (2 × 2.094) = 0.133.
-4. **Verify by sweep** (§11 item 7) on the new arm.
+*Deferred alternative:* adaptive λ keyed to an online σ_min estimate `[UNVERIFIED literature —
+Sahil must check before citing any author]`. Cost of a per-cycle σ_min estimate at 1 kHz is not
+measured. Forcing trigger: before a second robot enters MuJoCo.
 
-**Note that steps 2 and 3 are incompatible on the Gen3: 0.05 < 0.133.** That is deliberate,
-not an error. λ = 0.05 permits `‖q̇‖ ≤ 0.559/0.10 = 5.59 rad/s` against a 2.094 rad/s cap —
-which is why SafetyFilter Site 3 is measured firing at 3.39 rad/s in normal operation rather
-than acting as a last-resort guard. **λ buys accuracy; Site 3 enforces the cap.** Step 3 is
-binding only on a robot with no Site-3 equivalent.
+#### 5.3.5 Numerical method — LDLᵀ, no inverse
 
-*Alternative, deferred:* adaptive λ keyed to an online σ_min estimate (Chiaverini et al. 1994;
-Maciejewski & Klein 1988 — **both unverified, read before citing**) removes per-robot tuning
-entirely. Cost is a σ_min estimate every cycle at 1 kHz, which is **not measured** and is a
-different and more expensive operation than the LDLᵀ solve in §6. Forcing trigger: decide
-before a second robot enters the MuJoCo environment.
+```
+A = J Jᵀ + λ² I₆        6×6, symmetric, positive definite for λ > 0   (xᵀAx = ‖Jᵀx‖² + λ²‖x‖² > 0)
+solve A y = v           LDLᵀ, y ∈ ℝ⁶
+q̇ = Jᵀ y                7×6 · 6×1
+```
 
-**Provenance for all numbers in §5.4.1.** COMPUTED, September 2026, by an independent Python
-reimplementation of the repo DH table — *not* by `computeJacobian`. Validated two ways: flange
-z = 1.1873 m at q = 0 (matches the C++ FK), and analytic `Jv` versus central finite difference
-agreeing to 1.4e-10 at a random non-singular pose. **Not yet reproduced from `computeJacobian`
-in C++** — do that before citing externally.
+**Why 6×6, not 7×7.** `Jᵀ(JJᵀ+λ²I₆)⁻¹ = (JᵀJ+λ²I₇)⁻¹Jᵀ` algebraically; the left form factorises
+a 6×6, the right a 7×7. The 6×6 is cheaper and natural for the underdetermined case.
+
+**Why LDLᵀ, not an explicit inverse or Cholesky.** No inverse is ever formed — `A.inverse()`
+computes more than is needed and discards conditioning information. Plain Cholesky (LLT) is
+also valid since A is SPD and marginally faster; LDLᵀ is chosen for backward stability, for
+graceful degradation if A becomes near-semidefinite, and because the pivot diagonal is a free
+conditioning indicator for later `[DESIGN]`. Fewer flops than forming the damped
+pseudoinverse — order 3–4× `[UNVERIFIED — count it or measure it before citing a factor]`.
+
+**Fails when** λ is not > 0 and finite (guarded), J or v non-finite (guarded — whether Eigen's
+`info()` flags a NaN-filled matrix is `[UNVERIFIED]`, hence explicit `allFinite()` on both ends),
+LDLᵀ reports failure, or the solution y is non-finite. All four ⇒ `ok = false`, `qdot` zero.
+
+**Number.** 1.90 µs mean, 3.04 µs p99.9 for the full `jointVelocityDLS` call `[MEASURED]` §8.2.
+Fixed-size `Matrix<double,6,6>`, stack-allocated, `noalias()`; no heap on the path
+`[INFERRED from the tight p99.9-vs-mean gap]`.
+
+### 5.4 Manipulability monitor
+
+`w = sqrt(det(JJᵀ))` (Yoshikawa), one 6×6 determinant, floored at 0 before the sqrt (rounding
+can make the computed det a tiny negative near singularity). Returns **NaN** when J is
+non-finite — "could not compute" — never 0.0, which is a real value meaning "exactly singular".
+`DlsResult::manipulability` stays NaN by design (D-20): the loop calls `manipulability(J)` and
+decides. Carries the §5.3.3 mixed-units wart; one small σ can be masked by large others.
+Choice of the production metric is deferred to 6.5 on measured timing (§9).
+
+### 5.5 Offline pose solver — `solveIK`
+
+DLS iteration with error-proportional damping `λ = 0.5·‖e‖ + 1e-4`, orientation error by vee of
+`R_target·R_currentᵀ`, plus a null-space joint-centring term `α·(I − J⁺J)·z₀`, α = 0.5.
+Dynamic-size Eigen, explicit inverse, `std::cerr` on non-convergence — acceptable **only**
+because it never runs on the 1 kHz path. `max_iterations ≤ 0` returns failure with −1.0 error
+norms ("did not run"). Round-trip smoke: 100 random configurations, expect ≥ 90 to close within
+1 mm `[COMPUTED, test_fk.cpp; count not recorded here]`.
+
+### 5.6 Safety filter — three sites
+
+Summary; full rationale, bounds table, counter invariants and protocol in `safety_filter.md`.
+
+```
+ Site 1  clipForce(F*n)          pre-reflex   scale |F*n| to f_n_max, sign preserved
+ Site 2  clipCartesian(twist)    post-reflex  α on [vx vy] · β on [wx wy wz] · workspace refusal
+                                              vz EXCLUDED from both norms (reflex owns it)
+ Site 3  clipJoint(q̇, q_send)    post-DLS     UNIFORM scale of the 7-vector · single-step
+                                              position refusal, directional (inward passes)
+```
+
+Why three sites and not one: force exists only before the reflex consumes it; the Cartesian twist
+only after the reflex supplies vz; joint rates only after DLS. Why uniform scaling: per-joint
+clipping changes the joint-space direction, hence the Cartesian direction the DLS just solved
+for. Why vz is excluded: two limiters in series on the force-controlled axis make neither one
+analysable. Decision D-07: engineered clipping with logged interventions; a formal barrier
+certificate is future work — a swap behind the same interface, not a retrain.
 
 ---
 
-## 6. Numerical method
+## 6 · Failure modes
 
-`q_dot = Jᵀ (J Jᵀ + λ² I₆)⁻¹ v` is **not** evaluated by forming an inverse. It is evaluated as
-a linear solve:
-
-```
-Step 1:  A = J Jᵀ + λ² I₆                       (6×6, symmetric, positive definite for λ > 0)
-Step 2:  solve  A x = v   for x                 (LDLᵀ factorisation, x is 6×1)
-Step 3:  q_dot = Jᵀ x                           (7×6 · 6×1 → 7×1)
-```
-
-**Why the 6×6 form.** The algebraic identity `Jᵀ(J Jᵀ + λ²I₆)⁻¹ = (Jᵀ J + λ²I₇)⁻¹Jᵀ` means
-either could be used, but the left form factorises a 6×6 matrix and the right a 7×7. The 6×6
-is cheaper and is the natural form for the underdetermined case.
-
-**Why LDLᵀ.** It is a square-root-free symmetric factorisation `A = L D Lᵀ`, solved by three
-triangular passes (forward substitution, diagonal scaling, back substitution). It exploits
-symmetry and never forms an inverse; forming `A.inverse()` and multiplying computes more than
-is needed and discards conditioning information. Because λ > 0 makes `A` strictly positive
-definite, plain Cholesky (`LLT`) is also valid and marginally faster; **LDLᵀ is chosen for
-backward stability and because the pivot diagonal is a free conditioning indicator**, and it
-degrades gracefully if `A` becomes near-semidefinite. Revisit at 6.5 if timing demands.
-
-*(The `A` matrix is fixed-size `Matrix<double,6,6>`, stack-allocated; `noalias()` suppresses
-Eigen temporaries. No heap allocation on the 1 kHz path — confirmed by the tight p99.9 in §9.)*
-
----
-
-## 7. API specification
-
-```cpp
-/**
- * @brief Result of one differential inverse-kinematics solve.
- */
-struct DlsResult {
-    Eigen::Matrix<double,7,1> qdot            = Eigen::Matrix<double,7,1>::Zero();
-                                     ///< 7x1 joint velocities [rad/s], joint order 1..7
-    Eigen::Matrix<double,6,1> twist_achieved  = Eigen::Matrix<double,6,1>::Zero();
-                                     ///< 6x1 J*qdot, BASE frame [m/s; rad/s]. Differs from the
-                                     ///< commanded twist by the damping residual.
-    double lambda_used   = 0.0;      ///< Damping actually applied this cycle (mixed units, §5.4)
-    double manipulability = std::numeric_limits<double>::quiet_NaN();
-                                     ///< NOT computed here by design (D-20). NaN = "not computed";
-                                     ///< 0.0 would falsely mean "exactly singular" (P22).
-    bool   ok            = false;    ///< false => qdot is zeroed; caller MUST NOT command it
-};
-
-/**
- * @brief Linear-algebra core: solve (J·Jᵀ + λ²I) x = twist, qdot = Jᵀx. PUBLIC (D-26) so a
- *        test can inject a known J directly. Guards λ (>0, finite) and finiteness of J/twist.
- */
-DlsResult solveDLS(const Eigen::Matrix<double,6,7>& J,
-                   const Eigen::Matrix<double,6,1>& twist_des,
-                   double lambda) const;
-
-/**
- * @brief Single-shot damped least-squares differential IK for the 1 kHz loop.
- *
- * @param q_meas_rad  Current MEASURED joint configuration [rad], order 1..7. Use q_meas from
- *                    feedback, not commanded q_send: the Jacobian is evaluated where the arm is.
- * @param twist_des   Desired EE twist, BASE frame. Rows 0-2 linear [m/s], 3-5 angular [rad/s].
- *                    The caller performs any task→base rotation.
- * @param lambda      Damping (>0, finite). Provisional 0.05; set by the 6.4 sweep.
- * @return DlsResult. On any guard failure, ok == false and qdot is zeroed.
- *
- * @note Returns rad/s. The caller converts to degrees before integrating into q_send.
- * @note Performs NO clamping, NO null-space projection, NO integration (see below).
- */
-DlsResult jointVelocityDLS(const std::array<double,7>& q_meas_rad,
-                           const Eigen::Matrix<double,6,1>& twist_des,
-                           double lambda) const;
-```
-
-### Not this function's job — and why
-
-Each of these is excluded deliberately. Each belongs somewhere else in the stack.
-
-| Excluded | Why | Where it lives |
+| Mode | Where detected | Behaviour |
 |---|---|---|
-| **Velocity clamping** | Clamping here would silently distort the twist direction and hide it from the safety layer. Safety must be enforced in one auditable place. | **SafetyFilter**, downstream |
-| **Null-space projection** | The 7-DOF redundancy is real and worth using, but a secondary objective changes `q_dot` for reasons unrelated to the commanded twist. Introducing it before the primary solve is characterised makes the λ sweep uninterpretable. | Deferred. Post-Phase-0 decision. |
-| **Task → base rotation** | The task frame is latched at CONTACT entry and owned by the contact state machine. Rotating inside the IK would give this library a dependency on task state it has no business holding. | Caller (1 kHz loop) |
-| **Integration to position** | `q_send` is the loop's integrator state under the commanded-anchor scheme. A kinematics library must be stateless with respect to the control loop. | 1 kHz loop |
-| **Joint-limit checking** | Same argument as clamping: one auditable safety layer. | SafetyFilter |
+| `q_meas` contains NaN/inf (dropped or partial BaseCyclic frame) | per-joint `isfinite` in `jointVelocityDLS` | `ok = false`, `qdot` zero, before it reaches the DH chain |
+| `twist` or `J` non-finite | `allFinite()` in `solveDLS` | `ok = false`, `qdot` zero |
+| λ ≤ 0, NaN, ±∞ (config typo) | guard in `solveDLS` | `ok = false`, `qdot` zero |
+| LDLᵀ reports failure | Eigen `info() != Success` | `ok = false`, `qdot` zero |
+| Solution y non-finite | `y.allFinite()` | `ok = false`, `qdot` zero |
+| Near-singular configuration | `manipulability(J)` by the caller | **Not a failure.** Damping bounds it (BOUND-1); `ok` stays true; Site 3 caps; the caller decides |
+| q outside joint limits | not checked in the IK | Site 3 position refusal, single-step lookahead |
+| Non-finite input at any filter site | `isfinite` / `allFinite()` at each site | zero output, `NON_FINITE_REJECTED`, counted once per site; `pos_refused_mask = 0` |
+| inf in a filter input | same guard | Caught explicitly — `inf > bound` is *true*, so an unguarded site would log a phantom intervention into the O3 count |
+
+**`ok == false` means hold, not skip.** The loop's correct response is to keep `q_send` at its
+previous value and still call `Refresh()` — skipping the call trips the firmware watchdog.
 
 ---
 
-## 8. Manipulability — DEFERRED to 6.5
+## 7 · Testing
 
-`DlsResult::manipulability` defaults to `quiet_NaN()` and is **not computed** in `solveDLS`
-(D-20). The metric that will report proximity to singularity is **not yet chosen**. Candidates:
+All tests run off-robot; no mock is needed because there is no vendor dependency. `solveDLS`
+being public (D-26) is what makes the linear algebra testable against an injected J.
 
-| Candidate | Cost | Sensitivity near singularity | Note |
-|---|---|---|---|
-| Yoshikawa `w = sqrt(det(J Jᵀ))` | One 6×6 determinant | Goes to zero, but as a *product* of all σ — one small σ can be masked by large others | Carries the §5.4 mixed-units defect |
-| `σ_min` from SVD | Full 6×7 SVD | Direct and unambiguous | Likely unaffordable at 1 kHz — measure before rejecting |
-| `det(J Jᵀ + λ²I)` as proxy | Free — already factorised in §6 | Biased by λ, floors out rather than reaching zero | Cheapest; least meaningful |
-| Condition number `σ_max/σ_min` | Full SVD | Direct | Same cost objection |
+**`test_dls.cpp` — 17 cases.** Fixtures are `[diag(s₀..s₅) | 0]` Jacobians, so singular values
+are known exactly and one can be placed at σ = λ; a **duplicate-column** variant gives a
+non-trivial null space so the minimum-norm claim is falsifiable rather than tautological.
 
-**Decision criterion, to be applied at 6.5:** measure the wall-clock cost of each against the
-remaining budget (§9), then pick the most sensitive metric that fits. Do not pick on
-principle before the timing is measured. The 21 Aug monitor computes `sqrt(det(J Jᵀ))` itself,
-since the struct field stays NaN.
+1. Fixture self-check. 2. Pseudoinverse limit as λ → 0. 3. Minimum norm (even split across
+duplicated joints). 4. Zero twist ⇒ exactly zero. 5. Linearity. 6. BOUND-1 attained at σ = λ.
+7. BOUND-1 never exceeded over a λ × σ grid. 8. λ monotonicity (slower, larger residual).
+9. Diagnostics describe the solve that ran. 10–12. Guards: λ (0, negative, NaN, **inf** — inf
+passes `λ > 0` and is caught only by `isfinite`), non-finite J, non-finite twist.
+13. Non-finite q at every joint. 14. BOUND-1 on real Jacobians at four configurations, σ_min
+printed from a test-only SVD. 15–17. `manipulability`: known value 720, rank-deficient ⇒ 0.0,
+non-finite ⇒ NaN.
 
-*Note:* the Week 16 visual-servoing work already plans to monitor `sqrt(det(J Jᵀ))`. If
-Yoshikawa is selected here, that is one metric across the project rather than two.
+**`test_safety_filter.cpp` — 28 cases.** Each bound in isolation; sign preservation at Site 1;
+vz exclusion from both Site 2 norms; α/β independence; inward motion allowed at the workspace
+faces and past joint limits (recovery); uniform-scaling ratio preservation; continuous-joint
+sentinels never refuse; zero-input paths (HOLD runs them 1000×/s); non-finite rejection at all
+three sites with telemetry pinned (no phantom bound counts); counter accumulation, `total()`,
+`reset()`, and 1000 nominal cycles with zero interventions. Tolerance `kTol = 1e-9` — seven
+orders above double round-off on O(1) SI quantities, eight below the smallest meaningful bound
+difference `[DERIVED]`.
+
+**Benchmarks** (`benchmark_dls.cpp`, `benchmark_safety_filter.cpp`) are not tests; the filter
+benchmark asserts its counter invariants and exits 1 on disagreement.
+
+**Fixture warning — q = 0 is a singularity** `[COMPUTED]`: rank 3, three singular values exactly
+zero from this DH table. Valid as an FK fixture (z = 1.1873 m validates the table), invalid for
+anything conditioning-related and invalid as the loop's initialisation pose.
+
+**Pending:** 7. λ sweep — λ vs residual (nominal pose) and peak ‖q̇‖ (near-singular pose);
+selects production λ. Hardware FK-vs-Kortex (Step 3).
+
+**Determinism.** No randomness in gtest cases; `test_fk.cpp` uses a fixed seed (42).
 
 ---
 
-## 9. Timing budget
+## 8 · Measured results
 
-The cycle is 1000 µs. Measured on hardware, the `Refresh()` UDP round-trip consumes
-approximately 350 µs mean. That leaves roughly 650 µs, from which the IK, the admittance
-reflex, the safety filter and the observation build must all be paid.
+### 8.1 FK checks `[COMPUTED]`
 
-### 9.1 Inverse kinematics — `jointVelocityDLS`
+Flange z = 1.1873 m at q = 0 (before tool offset); ±0.3 rad on joint 1 gives equal z and
+mirrored x. Validates the DH table, not the Jacobian (q = 0 is singular).
 
-Per call, `jointVelocityDLS` costs: one numerical Jacobian (7 perturbation FK evaluations
-plus the base FK, so 8 DH chain evaluations), one 6×7 · 7×6 product, one 6×6 LDLᵀ
-factorisation and solve, one 7×6 matrix–vector product.
+### 8.2 Differential IK latency `[MEASURED]`
 
-**Measured — Step 6.2** (`benchmark_dls`, N = 1,000,000, `RelWithDebInfo`, SCHED_FIFO
-`chrt -f 80`, `taskset -c 2` on a confirmed P-core):
+`benchmark_dls`, 4 Sep 2026, N = 10⁶, RelWithDebInfo (`-O2 -g -DNDEBUG -std=gnu++17`, verified
+in `compile_commands.json` 4 Sep 2026), SCHED_FIFO `chrt -f 80`, `taskset -c 2` (P-core).
 
-| Metric | jointVelocityDLS |
-|---|---|
-| mean | **1.90 µs** |
-| p50 | 1.86 µs |
-| p99 | 2.35 µs |
-| p99.9 | **3.04 µs** |
-| max (1 in 10⁶) | 94.4 µs |
-| clock-read floor | 9 ns |
-| cycle budget | 1000 µs |
+| mean | p50 | p99 | p99.9 | max (1 in 10⁶) | budget |
+|---|---|---|---|---|---|
+| 1.90 µs | 1.86 µs | 2.35 µs | **3.04 µs** | 94.4 µs | 1000 µs |
 
-The IK stage uses **~0.2 % of the cycle typically and ~0.3 % at the 1-in-1000 tail** — decisive
-headroom. The tight p99.9-vs-mean gap is the evidence that the fixed-size path does not
-heap-allocate. The dominant term is expected to be the numerical Jacobian, not the linear
-algebra, but the Jacobian/solve **split is not separately measured** — that remains an
-expectation, to be split at 6.5 only if a budget problem ever appears (it has not).
+0.2 % of the cycle typically, 0.3 % at the 1-in-1000 tail. Jacobian/solve split **not measured**
+— the expectation that the numerical Jacobian dominates is `[UNVERIFIED]`; split at 6.5 only if
+a budget problem appears.
 
-**Build flags are part of the number.** `-O2 -g -DNDEBUG -std=gnu++17`, confirmed in
-`compile_commands.json` on 4 Sep 2026. Eigen relies on inlining to collapse expression
-templates; at `-O0` that collapse does not happen and the measurement is meaningless.
+### 8.3 Safety filter latency `[MEASURED]`
 
-### 9.2 Safety filter — three sites
-
-**Measured — Step 6.4** (`benchmark_safety_filter`, N = 1,000,000 per scenario, identical
-protocol to §9.1 — same build type, same `chrt -f 80 taskset -c 2`, which is what makes the
-two numbers additive). Four scenarios, because the filter has data-dependent branches and
-therefore no single worst case. Full rationale and bounds: `safety_filter.md`.
-
-Two runs of identical code, 4 Sep 2026, all values in ns:
+`benchmark_safety_filter`, 4 Sep 2026, N = 10⁶ per scenario, same protocol as §8.2 (which is
+what makes the two numbers comparable). Two runs of identical code, `run1 / run2` where they
+differ, all ns:
 
 | Scenario | mean | batched | p50 | p99 | p99.9 | max |
 |---|---:|---:|---:|---:|---:|---:|
-| NOMINAL | 20.7 / 21.0 | 10.1 / 10.0 | 21 | 26 / 27 | 33 / 35 | 1623 |
-| ALL_TRIP | 30.5 / 30.2 | 15.2 / 15.0 | 30 | 35 / 36 | 38 / 39 | 964 |
-| ALTERNATING | 25.6 | 12.5 / 12.6 | 27 / 28 | 34 / 35 | 36 / 40 | 6851 |
-| NON_FINITE | 12.6 | 5.0 / 5.1 | 13 | 14 | 26 / 21 | 7338 |
+| NOMINAL | 21.0 / 20.7 | 10.0 / 10.1 | 21 | 27 / 26 | 35 / 33 | 5391 / 1623 |
+| ALL_TRIP | 30.2 / 30.5 | 15.0 / 15.2 | 30 | 36 / 35 | 39 / 38 | 1311 / 964 |
+| ALTERNATING | 25.6 | 12.6 / 12.5 | 28 / 27 | 35 / 34 | 40 / 36 | 1142 / 6851 |
+| NON_FINITE | 12.6 | 5.1 / 5.0 | 13 | 14 | 21 / 26 | 785 / 7338 |
 
-Clock-read floor 9 ns in both runs.
+**Reportable:** worst p99.9 across scenarios and runs **≤ 40 ns** = 0.004 % of the cycle.
+**True single-cycle cost is bracketed 5–30 ns**: `batched` (64 cycles per clock-read pair)
+excludes clock overhead but runs back to back as the real loop never does — lower bound;
+`mean` (per-iteration) pays one clock read the real loop never pays — upper bound. Report the
+bracket, never either column alone.
 
-**Reportable: worst p99.9 ≤ 40 ns across runs = 0.004 % of the cycle.** The filter is free.
-Any future argument about filter complexity is a correctness argument, never a latency one.
+**No worst-case scenario is named.** The label moved between the runs (ALTERNATING 40 ns, then
+ALL_TRIP 38 ns) on identical code; the scenarios are 1–5 ns apart at single-digit-ns clock
+resolution. The branch-predictor hypothesis behind ALTERNATING is neither supported nor refuted.
+The `max` column is OS events, not filter work: the outlier landed on NOMINAL in one run and
+NON_FINITE in the other.
 
-**Reading the two mean columns.** `batched` divides one pair of clock reads across 64
-cycles, so it excludes clock overhead — but the 64 cycles run back to back, which the real
-loop never does. `mean` is per-iteration, so it excludes that effect but pays one ~9 ns
-clock read the real loop never pays. **The true single-cycle cost is bracketed between
-them: roughly 5–30 ns.** Both bounds are negligible against 1000 µs.
+**Counter invariants, same runs:** NOMINAL all counters 0; ALL_TRIP 1,000,000 on every bound,
+mask 42; ALTERNATING 500,000 on every bound (confirms the table cycles), mask 42; NON_FINITE
+`non_finite_rejected` = 3,000,000 = 3 × N.
 
-**Do not name a worst-case scenario.** The label moved between the two runs (ALTERNATING
-at 40 ns, then ALL_TRIP at 38 ns) on identical code. The four scenarios are separated by
-1–5 ns at a 9 ns clock resolution — indistinguishable in the tail. The branch-predictor
-hypothesis behind ALTERNATING is neither supported nor refuted by this data. The
-defensible claim is a bound, not a ranking. The `max` column is dominated by OS events,
-not filter work: the outlier landed on NOMINAL in one run and NON_FINITE in the other.
+### 8.4 Composed cost — estimate, not a result
 
-### 9.3 Composed cost — estimate only
+Mean-sum 1.90 µs + ~0.02 µs ≈ 1.9 µs; tail-sum 3.04 µs + 0.04 µs ≈ 3.1 µs. The p99.9 of a sum
+is not the sum of the p99.9s (that assumes perfectly correlated tails — conservative, not
+measured). The reportable composed number comes from instrumenting the assembled loop end to
+end (Step 8). Against the ~650 µs left after the ~350 µs mean `Refresh()` round-trip
+`[MEASURED on hardware, Step 3, kinova-wrapper]`, both estimates are go.
 
-1.90 µs + 40 ns ≈ **1.9 µs, ~0.19 % of the cycle.** This is a go/no-go estimate, not a
-result. The p99.9 of a sum is not the sum of the p99.9s — that treats the two tails as
-perfectly correlated, which is conservative but not measured. The reportable composed
-number must come from instrumenting the assembled 1 kHz loop end to end.
+### 8.5 Clock floor — conflicted, not cited
 
----
+Readings of 9 ns and 13 ns exist across sources for the same measurement. Resolve before
+publishing any timing number (Step 9). No figure in this document depends on it except the
+5–30 ns bracket's interpretation, which holds under either value.
 
-## 10. Failure modes
-
-| Mode | Detection | Behaviour |
-|---|---|---|
-| `q_meas_rad` contains NaN/Inf | per-joint `isfinite` in `jointVelocityDLS` | `ok = false`, `qdot` zeroed, before it spreads |
-| `twist_des` / `J` contains NaN/Inf | `allFinite()` in `solveDLS` | `ok = false`, `qdot` zeroed |
-| λ ≤ 0 or non-finite | `!(lambda > 0.0) \|\| !isfinite(lambda)` in `solveDLS` | `ok = false`, `qdot` zeroed |
-| LDLᵀ reports failure | Eigen `info() != Success` | `ok = false`, `qdot` zeroed |
-| Solve produces non-finite `y` | `y.allFinite()` after solve | `ok = false`, `qdot` zeroed |
-| Near-singular configuration | (caller-computed manipulability) | **Not a failure.** Damping handles it; `ok` stays true. The caller decides. |
-| `q_meas` outside joint limits | Not checked here | Caller / SafetyFilter responsibility (§7) |
-
-**`ok == false` means `qdot` must not be commanded.** The 1 kHz loop's correct response is to
-hold `q_send` at its previous value — *not* to skip the `Refresh()` call, which would trip the
-firmware watchdog. Holding position is the safe degenerate command. (Twist size is now a
-compile-time invariant — `Eigen::Matrix<double,6,1>` — so a runtime size check is no longer
-needed.)
-
----
-
-## 11. Testing strategy (off-robot)
-
-All tests run against the mock build and require no arm. `solveDLS` being public is what makes
-the linear algebra directly testable with an injected `J` (D-26).
-
-**Correctness**
-1. **Round trip.** Pick a well-conditioned `q`, choose an arbitrary `q_dot_true`, compute
-   `v = J·q_dot_true`, solve. With small λ, `‖J·q_dot − v‖` must be small (`EXPECT_NEAR`, not
-   exact — damping guarantees a residual).
-2. **Minimum norm.** For the same `v`, the returned `‖q_dot‖` must not exceed `‖q_dot_true‖`
-   by more than the damping residual. The minimum-norm test uses a **duplicate-column**
-   Jacobian so the null space is non-trivial and the claim is falsifiable (not a tautology).
-3. **Zero twist.** `v = 0` must give `q_dot = 0`.
-4. **Linearity.** `solve(2v) == 2·solve(v)`, within tolerance.
-
-**Damping behaviour**
-5. **Bounded near singularity.** Near-singular configuration, twist along the degenerate
-   direction: `‖q_dot‖` must stay finite and respect BOUND-1.
-6. **λ monotonicity.** Sweep λ upward at fixed config: residual increases monotonically,
-   `‖q_dot‖` decreases monotonically.
-7. **λ sweep (6.4 deliverable).** Table of λ vs residual (nominal) and peak `‖q_dot‖`
-   (near-singular). Selects production λ; goes in the repo.
-
-**Robustness**
-8. NaN twist, NaN `q_meas`, λ = 0 / negative / ±∞ — all handled per §10 (`DlsRejectsNan`).
-
-**Fixture choice — `q = 0` is a singularity.** Computed from this library's DH table, the
-all-zeros configuration has **rank 3**, with three singular values exactly zero. It must not be
-used as a fixture for anything conditioning-related, nor as the initialisation pose for the
-1 kHz loop or a mock run. It remains valid as an FK fixture (z = 1.1873 m) — a different
-claim, since an FK check at a singular pose validates the DH table and says nothing about the
-Jacobian.
-
-**Determinism.** No randomness, or fixed logged seed.
-
----
-
-## 12. Open items
-
-| Item | Status | Blocks |
-|---|---|---|
-| Production λ | Provisional 0.05; set by the 6.4 sweep. At σ ≈ 0.105 (ordinary pose) attenuation is 0.81 — ~19 % lost. Selection procedure and link-scale sensitivity: §5.4.1 | Hardware integration (6.6+) |
-| Tool offset as config parameter | **Resolved Sep 2026.** Constructor parameter `tool_offset_z`, stored as `tool_offset_z_`, applied in `computeFK`. Default 0.113 m; Kortex is configured at 0.12 m — the 7 mm gap is bookkeeping by construction, not FK error (D-14) | Closed |
-| Jacobian/solve timing split | Total measured (§9); split not measured | 6.5, only if a budget problem appears |
-| Manipulability metric | Deferred to 6.5 on measured timing; field stays NaN | 6.5 |
-| Mixed-units λ (§5.4) | Documented, not fixed. Weighted-Jacobian proposal deferred | Nothing in v1 |
-| `solveIK` `dx`/`dw` guard | `Vector3d dx, dw;` uninitialised; UB if `max_iterations ≤ 0`. Zero-init or guard | Before `solveIK` is relied on |
-| Joint velocity limits | **Resolved Aug 2026.** 120 °/s joints 1–4, 200 °/s joints 5–7; now in `SafetyBounds::joint_vel_max`. Still not in this library — `jointVelocityDLS` is deliberately unlimited (§7) | Closed |
-| Joint position limit duplication | Limits exist in `KinovaKinematics.cpp` (2.2497 / 2.5795 / 2.0996311) **and** `SafetyFilter.hpp` (2.2515 / 2.5800 / 2.0996) — drifted at the 4th decimal. Worse, the two files use **different sentinels** for the continuous joints: ±2π here, ±1e9 in the filter. Those are not equivalent — 2π refuses at 6.28 rad, 1e9 never refuses. Harmless today (`jointVelocityDLS` is deliberately unlimited, §7, and only the filter enforces), but the verified `pos_refused_mask == 42` invariant holds **only** under the 1e9 sentinel. A manifest that adopts ±2π makes the mask 127 and breaks the invariant silently. Single manifest required — D-27 | Manifest schema |
-| Adaptive λ | Deferred. Removes per-robot tuning; cost unmeasured. §5.4.1 | Second robot in MuJoCo |
-
----
-
-## 13. Verification status
+### 8.6 Verification ledger
 
 | Claim | Basis |
 |---|---|
-| Classical DH is the correct convention for the Gen3 | Flange z = 1.1873 m at **q = 0** (all joints zero, analytic FK, before tool offset); symmetry checks pass. q = 0 is itself singular (§11), so this validates the DH table only. **Hardware FK-vs-Kortex comparison pending D-14** |
-| `J` is 6×7 and the system is underdetermined | Structural, from the 7-DOF arm |
-| `g_max = 1/(2λ)` at `σ = λ` | **Derived**, §5.2. Reproducible by hand. |
-| LDLᵀ needs no matrix inverse | Property of the factorisation |
-| `jointVelocityDLS` mean 1.90 µs / p99.9 3.04 µs | **Measured**, Step 6.2 (§9.1), N = 10⁶, RT + pinned |
-| Benchmark build flags `-O2 -g -DNDEBUG` | **Verified** 4 Sep 2026 from `compile_commands.json`, both benchmark targets |
-| SafetyFilter worst p99.9 ≤ 40 ns | **Measured**, Step 6.4 (§9.2), N = 10⁶ per scenario × 4 scenarios, two runs, same protocol as 6.2 |
-| SafetyFilter true single-cycle cost 5–30 ns | **Bracketed**, not measured directly — batched and per-iteration means bound it from below and above (§9.2) |
-| No scenario is the filter's worst case | **Measured.** Label moved between two runs of identical code; spread 1–5 ns at 9 ns clock resolution |
-| Non-finite guard fires at all three sites | **Measured.** `non_finite_rejected` = 3,000,000 = 3 × N under NON_FINITE, asserted by the benchmark |
-| Only joints 2, 4, 6 can position-refuse | **Measured.** `pos_refused_mask` = 42 (`0b0101010`) under ALL_TRIP and ALTERNATING; continuous-rotation sentinels never refuse |
-| NOMINAL path is filter-silent | **Measured.** All counters 0 over 10⁶ cycles with inputs inside every bound — the D-09 premise |
-| Composed IK + filter cost ~1.9 µs | **Estimate only.** Sum of two independently measured p99.9 values; tails assumed correlated. Not measured end to end (§9.3) |
-| No heap allocation on the 1 kHz path | Inferred from the tight p99.9-vs-mean gap; fixed-size Eigen throughout |
-| `Refresh()` costs ~350 µs mean | **Measured on hardware**, Step 3 |
-| Numerical Jacobian dominates the per-call cost | **UNVERIFIED expectation.** Split not measured. |
-| Gen3 joint *velocity* limits | **[SPEC], Aug 2026.** 120 °/s joints 1–4, 200 °/s joints 5–7, from the Kortex actuator specification. Applied in `SafetyBounds`. **Not confirmed by hardware test.** |
-| `q = 0` is a singularity, rank 3 | **Computed** from this library's DH table. Three singular values exactly zero. |
-| σ spectrum and link-scale table (§5.4.1) | **Computed** by an independent reimplementation, not by `computeJacobian`. Cross-checks: FK z = 1.1873 at q = 0; analytic vs finite-difference `Jv` to 1.4e-10. **Not yet reproduced in C++.** |
-| λ selection formulae (§5.4.1 steps 2–3) | **Derived** from BOUND-1 (§5.2). Reproducible by hand. |
-| DLS literature references (§5.4.1) | **UNVERIFIED.** Found via search, primary sources not read. Do not cite without checking. |
+| Classical DH is correct for the Gen3 | `[COMPUTED]` z = 1.1873 m at q = 0; symmetry. Hardware comparison pending (Step 3, D-14) |
+| BOUND-1, λ selection formulae | `[DERIVED]` §5.3.2, §5.3.4 |
+| IK mean 1.90 µs / p99.9 3.04 µs | `[MEASURED]` §8.2 |
+| Filter worst p99.9 ≤ 40 ns; cost 5–30 ns | `[MEASURED]` bound; bracket from two bounds §8.3 |
+| Non-finite guard live at all three sites; mask 42; NOMINAL silent | `[MEASURED]` counter self-checks §8.3 |
+| No heap on the 1 kHz path | `[INFERRED]` from tail tightness; fixed-size Eigen throughout |
+| Joint velocity limits 120 / 200 °/s | `[SPEC]` Kortex actuator specification, Aug 2026; not confirmed by hardware test |
+| Joint position limits ±2.2515 / 2.5800 / 2.0996 rad | `[SPEC]` Kinova Gen3 User Guide Table 39 |
+| High-level library limits (Tables 40–41) not applied in low-level servoing | `[SPEC]` User Guide reading; `[UNVERIFIED]` by test |
+| σ spectrum, link-scale table | `[COMPUTED]` independent reimplementation; not yet reproduced in C++ |
+| q = 0 is rank 3 | `[COMPUTED]` |
+| Numerical Jacobian dominates per-call cost | `[UNVERIFIED]` — split not measured |
+| Literature references (variable damping, characteristic length, hybrid force/motion) | `[UNVERIFIED — Sahil must check]`; no author or venue is cited here on purpose |
 
 ---
 
-*Kinova Gen3 force-conditioned skills — Advanced Biomechatronics and Locomotion Lab,
-Carleton University. Phase 0, Steps 6.2 + 6.4 — IK and safety filter benchmarks closed,
-4 September 2026.*
+## 9 · Open decisions
+
+| ID / item | Gates | What settles it |
+|---|---|---|
+| D-01 obs width 38 vs 39 | MuJoCo environment build | Decision with Prof. Ahmadi on the recovery phase |
+| D-04 manifest mechanism | Sourcing `SafetyBounds` and joint limits from one place | Block A Step 6 |
+| D-07 CBF vs engineered clipping | Decided: clipping. Barrier certificate is future work | Prof. Ahmadi, only if reopened |
+| D-09 final bound values | O3 being meaningful | Trained action distribution |
+| D-14 tool offset | Hardware FK check | Step 3 records FK-vs-Kortex with the 7 mm accounted for |
+| D-20 manipulability metric | Singularity monitor in the loop | Wall-clock cost of each candidate against the remaining budget (§5.4) — measure before choosing |
+| D-27 joint-limit duplication and sentinel mismatch | Manifest schema; `pos_refused_mask` invariant | Single source of truth. ±2π (kinematics) vs ±1e9 (filter) are **not equivalent**: 2π refuses at 6.28 rad, 1e9 never refuses; a manifest adopting ±2π silently changes the mask from 42 to 127 |
+| Production λ | Hardware integration | λ sweep (§7 item 7) |
+| Adaptive λ | Second robot in MuJoCo | Measure a per-cycle σ_min estimate's cost first |
+| Position refusal: is bounding `q_send` enough? | Whether Site 3 needs a margin | Step 3 overshoot measurement on joints 2/4/6: peak `q_meas − q_send` after a step, several speeds. If zero, `v·dt` on `q_send` is correct and the `stop_horizon_s` rename is dropped; otherwise add margin ε to `SafetyBounds` (with D-04). τ = 15.7 ms is the lag, not the fix — a τ horizon applies only to a check made against `q_meas` |
+| `IKResult::joint_states` fill on failure (NaN vs zero) | Step 1 loop bring-up | Sahil decides |
+| Clock-floor conflict | Any published timing number | Re-measure under one protocol (Step 9) |
+| Firmware position-limit enforcement in low-level servoing | Whether Site 3 is the sole guard | SDK header grep, Kinova support, or an empirical test on joint 4 |
+| Sustained-intervention flag | Reflex integrator divergence under sustained scaling | Undecided whether the filter raises a flag or only counts |
+
+---
+
+## 10 · Limitations
+
+- Everything has run off-robot only. Hardware FK, τ on the limited joints, and firmware limit
+  behaviour are pending.
+- The Jacobian is numerical; `eps` is unswept.
+- One scalar λ across mixed-unit rows; λ is per-robot and must be re-tuned on every port.
+- The composed loop cost is an estimate; the clock floor is conflicted.
+- Site 2 mixes a task-frame twist with a base-frame position; valid only near axis alignment.
+- Site 3 bounds the commanded setpoint, not the measured joint. Lag alone cannot cause a
+  violation; servo overshoot could, and is not measured (Step 3).
+- `SafetyBounds` defaults are header literals awaiting D-04/D-09; joint limits are duplicated
+  and drifted (D-27).
+- The σ-spectrum and link-scale tables come from a Python reimplementation, not from this C++.
+- No literature is cited with authors here because none has been read in primary form.
+- Precondition inherited from the stack: an external, calibrated 6-axis wrist F/T sensor.
+
+---
+
+## 11 · Changelog
+
+| Date | Change |
+|---|---|
+| 22 Aug 2026 | FK, Jacobian, `solveIK` implemented; classical DH confirmed; D-14 tool-offset question opened |
+| Aug 2026 | `solveDLS` / `jointVelocityDLS` (Step 6.1); joint velocity limits from Kortex spec into `SafetyBounds` |
+| 4 Sep 2026 | Step 6.2 IK benchmark and Step 6.4 filter benchmark closed; counter invariants verified over two runs; build flags verified |
+| Sep 2026 | Tool offset made a constructor parameter (D-14 bookkeeping); `manipulability()` monitor added; `max_iterations ≤ 0` guard added to `solveIK` |
+| 11 Sep 2026 | Documentation audited against `REPO_DOC_AUDIT_SPEC.md` v1.0: restructured to the required skeleton, provenance tags applied, clock floor withdrawn, composed cost relabelled as estimate |
+
+---
+
+*Advanced Biomechatronics and Locomotion Lab, Carleton University.*

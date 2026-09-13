@@ -3,7 +3,7 @@
 <package format="3">
   <name>kinova_kinematics</name>
   <version>1.0.0</version>
-  <description>FK, numerical Jacobian, and DLS IK solver for Kinova Gen3 7-DOF arm (Classical DH)</description>
+  <description>Idea 5 adapter, below the contract: from-scratch FK, numerical Jacobian, damped-least-squares differential IK and the three-site safety filter with intervention counting for the Kinova Gen3 7-DOF. Eigen only; builds and tests without the robot.</description>
   <maintainer email="sahil@todo.com">Sahil Narola</maintainer>
   <license>MIT</license>
 
