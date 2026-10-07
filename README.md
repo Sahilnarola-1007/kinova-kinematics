@@ -33,11 +33,11 @@ it builds and is fully tested on a machine with no robot attached.
                                │ [F*n, vx, vy, wx, wy, wz]
   1 kHz   BELOW THE CONTRACT ┌──────────────────────────────────────────────────────────┐
           (adapter)          │  SafetyFilter Site 1 (F*n)          ◄── THIS PACKAGE     │
-                             │  admittance reflex → vz             (admittance-controller)│
+                             │  admittance reflex → vz             (kinova_lowlevel)    │
                              │  SafetyFilter Site 2 (twist)        ◄── THIS PACKAGE     │
                              │  jointVelocityDLS → q̇               ◄── THIS PACKAGE     │
                              │  SafetyFilter Site 3 (q̇)            ◄── THIS PACKAGE     │
-                             │  q_send += q̇·dt → Refresh()         (kinova-wrapper)     │
+                             │  q_send += q̇·dt → Refresh()         (kinova_lowlevel)    │
                              │  computeFK → pose, 6D rotation      ◄── THIS PACKAGE     │
                              │  6-axis F/T sensor                  (mae-sensor-driver)  │
                              └──────────────────────────────────────────────────────────┘
@@ -48,7 +48,7 @@ Two independent paths run through this package and share no code:
 ```
   OBSERVATION SIDE (measured, flows up)        ACTION SIDE (commanded, flows down)
   ───────────────────────────────────          ─────────────────────────────────────
-  q_meas [rad]                                 twist_task [m/s, rad/s]  (vz from reflex)
+  q_meas [rad, signed]                         twist_task [m/s, rad/s]  (vz from reflex)
      │                                            │  Site 2 clip; caller rotates task→base
      ▼                                            ▼
   computeFK ─► T (base) [m]                    jointVelocityDLS(q_meas, twist_base, λ)
@@ -56,11 +56,11 @@ Two independent paths run through this package and share no code:
      │  = 6D orientation obs — NO Gram-Schmidt      ▼
      ▼                                         Site 3 clip (uniform scale, pos refusal)
   observation builder (kinova-wrapper)            ▼  q̇_safe [rad/s]
-                                               q_send = q_send_prev + q̇·dt  (kinova-wrapper)
+                                               q_send = q_send_prev + q̇·dt  (kinova_lowlevel)
 ```
 
 *Figure: this package's position in the Idea 5 layer model and the obs/action split inside it.
-Structural — nothing measured. Sep 2026.*
+Structural — nothing measured. Sep 2026; loop owner corrected to `kinova_lowlevel` Oct 2026.*
 
 ---
 
@@ -83,6 +83,10 @@ rates at which the 1 kHz loop is designed to call them `[DESIGN]`.
 | `SafetyFilter::clipCartesian(twist, ee_pos)` | ACTION, Site 2 | in → out | `Matrix<6,1>`, `Vector3d` → `CartesianFilterResult` | twist **task**; ee_pos **base** | m/s, rad/s; m | 1 kHz |
 | `SafetyFilter::clipJoint(q̇, q_send)` | ACTION, Site 3 | in → out | `Matrix<7,1>` ×2 → `JointFilterResult` | joint space | rad/s; rad | 1 kHz |
 | `SafetyFilter::interventions()` | telemetry | out | `InterventionCounter&` | — | counts | on demand |
+
+`clipJoint` expects `q_send` in the **signed** convention, (−π, +π]: its position limits are
+symmetric about zero. Kortex reports [0°, 360°), so the loop converts at its own seam. FK and
+the Jacobian accept either.
 
 `DlsResult::ok == false` ⇒ `qdot` is zero and must not be commanded; the loop holds `q_send`.
 `DlsResult::manipulability` is `NaN` by design (D-20) — the monitor is `manipulability(J)`.
@@ -154,7 +158,26 @@ code, and the scenarios sit 1–5 ns apart at a single-digit-ns clock resolution
 
 **Composed IK + filter** `[ESTIMATE — not measured]`: mean-sum ≈ 1.9 µs; tail-sum (p99.9 + p99.9)
 ≈ 3.1 µs. Neither is a result. The reportable composed figure comes from instrumenting the
-assembled 1 kHz loop end to end (kinova-wrapper, Step 8).
+assembled 1 kHz loop end to end (`kinova_lowlevel`, Step 8).
+
+**On the arm, inside the 1 kHz loop** `[MEASURED]` `kinova_lowlevel` `step1_loop`, 7 Oct 2026,
+free space, scripted Cartesian motion from the Home pose, λ = 0.05, runs
+`1007_1556_signed_ws080_poseA_25s` and `1007_1616_signed_ws080_poseA_60s`:
+
+| Quantity | 25 s run | 60 s run |
+|---|---|---|
+| Cycles completed / faults | 25,000 / none | 60,000 / none |
+| Site 3 position refusals | 0 | 0 |
+| Whole per-cycle chain, compute only: p50 / p99.9 | 9.5 / 26 µs | 9.1 / 39 µs |
+| Tip x: commanded 0 → +3.18 cm → 0 | −0.10 … +3.08 cm | −0.23 … +3.08 cm |
+| Tip y: commanded 0 → +2.12 cm → 0 | −0.01 … +2.45 cm | −0.01 … +2.46 cm |
+| Tip z: not commanded | −0.17 … 0.00 cm | −0.34 … 0.00 cm |
+
+Tip positions are `computeFK` on the logged measured joints. Three things to read from it: the
+y overshoot (+15 %) is the damping cost of λ = 0.05 at this pose; the tip drifts about 1 mm per
+20 s because nothing closes the loop in task space; and an independent Python model of the chain
+predicted these ranges before the runs and matches the logs to 0.08 cm. Detail, and the 6 Oct
+run that found two silent one-way refusals, in `design.md` §8.6.
 
 **Clock floor:** readings conflict across sources (9 ns vs 13 ns). Not cited until resolved
 (Step 9).
@@ -174,17 +197,21 @@ the histogram is committed at Step 9.
   a sum-of-tails estimate; the Jacobian/solve split is not measured; the clock floor is
   conflicted. The σ spectrum and link-scale table in `design.md` §5.3 are `[COMPUTED]` by an
   independent Python reimplementation, not yet reproduced from `computeJacobian`.
-- **Hardware vs off-robot.** Everything in this package has run only off-robot. FK is verified
-  analytically at q = 0; the hardware FK-vs-Kortex comparison is pending (Step 3). Joint
-  velocity and position limits are `[SPEC]` from the Kortex actuator spec and User Guide, not
-  confirmed by hardware test. Whether the arm's firmware enforces position limits itself in
-  low-level servoing is `[UNVERIFIED]` — the filter is assumed to be the only enforcement.
+- **Hardware vs off-robot.** Unit tests and benchmarks are off-robot. On the arm the package
+  has run inside the 1 kHz loop in free space only: scripted motion from one pose, 6–7 Oct 2026.
+  FK is verified analytically at q = 0; the hardware FK-vs-Kortex comparison is pending
+  (Step 3). Joint velocity and position limits are `[SPEC]` from the Kortex actuator spec and
+  User Guide, not confirmed by hardware test. The arm's firmware does **not** enforce position
+  limits in low-level servoing `[SPEC — Kinova support, 4 Oct 2026]`: Site 3 is the only
+  enforcement.
 - **Decided vs open.** Engineered clipping is the decision (D-07; a formal barrier certificate
   is future work). Open: D-01 observation width (38 v1, 39 if a recovery phase is adopted);
   D-04 manifest mechanism — `SafetyBounds` defaults are header literals until it lands; D-09
-  final bound values (blocked on the trained action distribution); D-27 joint-limit values and
-  sentinels duplicated between `KinovaKinematics.cpp` and `SafetyFilter.hpp` and drifted at the
-  4th decimal; production λ (provisional 0.05, set by the λ sweep); manipulability metric (D-20).
+  final bound values (blocked on the trained action distribution; the workspace box was set
+  provisionally on 7 Oct 2026 to contain the Home pose); D-27 joint-limit values and sentinels
+  duplicated between `KinovaKinematics.cpp` and `SafetyFilter.hpp` — the two copies agree as of
+  7 Oct 2026, but they are still two copies; production λ (provisional 0.05, set by the λ sweep;
+  +15 % tracking error on one axis measured at the Home pose); manipulability metric (D-20).
 - **Stated precondition.** Site 1 clips a desired normal force that only means something if the
   target arm carries a mounted, calibrated external 6-axis wrist F/T sensor. An arm without one
   is out of scope for this stack.
@@ -198,9 +225,14 @@ the histogram is committed at Step 9.
 - **Site 2 frame mismatch.** `clipCartesian` bounds a task-frame twist but tests the workspace
   box on a base-frame position. Correct only while the two frames are near axis-aligned
   (horizontal-surface insertion) `[DESIGN]` — re-verify if the task frame rotates.
-- **`pos_lookahead_dt` = 1 ms is a single-step lookahead, not a stopping horizon.** Under the
-  measured first-order servo lag the stopping distance is `v·τ`, τ = 15.7 ms `[MEASURED, joint 7
-  only; UNVERIFIED for joints 2/4/6]`. Rename to `stop_horizon_s` and set to τ is an open item.
+- **Refusals are directional, so the start state must be inside the bounds.** A tip that starts
+  outside the workspace box, or a joint angle handed to Site 3 in the wrapped convention, can
+  move one way only, and nothing faults. Both happened on hardware on 6 Oct 2026
+  (`safety_filter.md`, *Hardware findings*).
+- **`pos_lookahead_dt` = 1 ms is a single-step lookahead on the commanded setpoint.** Site 3
+  bounds `q_send`, so servo lag (τ = 15.7 ms `[MEASURED, joint 7 only; UNVERIFIED for joints
+  2/4/6]`) cannot cause a violation by itself; servo overshoot could, and is not measured
+  (Step 3). The remedy, if any, is a margin on the limit (`design.md` §9).
 - **No joint velocity limits inside the IK** — deliberate; `jointVelocityDLS` is unclamped so
   that the one auditable limiter is Site 3.
 - **`solveIK` is offline only.** Dynamic-size Eigen, explicit inverse, `std::cerr` — none of
@@ -247,10 +279,14 @@ kinova_kinematics/
 **Done.** FK, numerical Jacobian, `solveDLS` / `jointVelocityDLS`, `manipulability()`,
 `solveIK` (offline), three-site `SafetyFilter` with `InterventionCounter`. 
 green off-robot (45 gtest cases in two binaries; `colcon test-result` reports 47,
-which includes the two binary-level CTest entries). 
+which includes the two binary-level CTest entries; re-run 7 Oct 2026 after the workspace box
+change, 47 of 47 pass). 
 IK and filter latency benchmarked (Steps 6.2, 6.4 closed 4 Sep 2026).
+Integrated into the 1 kHz loop (`kinova_lowlevel`) and run on the arm: 60 s of scripted
+free-space motion with zero refusals and no fault (7 Oct 2026).
 
-**In progress.** Integration into the 1 kHz loop (kinova-wrapper, Block A Step 1); λ sweep.
+**In progress.** λ sweep. The admittance reflex in `kinova_lowlevel` is next; it supplies the
+vz that Site 2 receives.
 
 **Open.** D-01, D-04, D-09, D-20, D-27; hardware FK-vs-Kortex check (Step 3); τ on joints
 2/4/6 (Step 3); clock-floor conflict (Step 9); servo overshoot on joints 2/4/6 (Step 3); adaptive λ (decide

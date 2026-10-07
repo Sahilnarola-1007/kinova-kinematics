@@ -20,13 +20,14 @@ differential IK (action side), a Yoshikawa singularity monitor, an offline itera
 and the three-site safety filter with intervention counting.
 
 **Out of scope, on purpose.** Task→base rotation, integration into `q_send`, the admittance
-reflex, the 1 kHz cyclic loop and its watchdog (all `kinova-wrapper` / `admittance-controller`).
+reflex, the 1 kHz cyclic loop and its watchdog. These live in `kinova_lowlevel`: `ControlCycle`
+is the per-cycle chain, `step1_loop` the transport, pacing and logging.
 Perception is out of scope for the whole portability argument: the socket is a fixed fixture and
 lateral error is injected in software at reset.
 
 **Convention.** Classical Denavit–Hartenberg, 8 frames (rows 0–7), radians throughout
 `[MEASURED — convention confirmed by FK checks, §8.1]`. The public API takes and returns radians;
-the deg↔rad seam is owned by the 1 kHz loop (D-25).
+the deg↔rad seam is owned by the 1 kHz loop (D-25), and so is the wrapped↔signed seam (§4).
 
 **Idea 5 goal, current wording.** One frozen force-conditioned policy performs a connector
 insertion across kinematically different cobots driven through position/velocity interfaces.
@@ -45,7 +46,7 @@ mounted, calibrated 6-axis wrist F/T sensor — a stated precondition, not an ac
 | R2 | Single-shot differential IK inside the 1 ms cycle | p99.9 ≤ 10 % of budget under SCHED_FIFO + pinned core, N ≥ 10⁶ | **Met**: p99.9 = 3.04 µs `[MEASURED]` (§8.2) |
 | R3 | Bounded joint-velocity amplification near singularity | Derived bound BOUND-1 (§5.3) holds in tests at every λ/σ pair and on real Jacobians | **Met** (`test_dls.cpp`) |
 | R4 | Fail-safe on non-finite input | Any NaN/inf in q, J, twist, λ ⇒ `ok = false`, `qdot` exactly zero, at every guard | **Met** (`test_dls.cpp`, `test_safety_filter.cpp`) |
-| R5 | Three-site clipping with per-bound intervention counts (O3) | Each bound fires in isolation and is counted once; NOMINAL inputs never fire; non-finite is counted per site | **Met** (28 tests; benchmark self-checks) |
+| R5 | Three-site clipping with per-bound intervention counts (O3) | Each bound fires in isolation and is counted once; NOMINAL inputs never fire; non-finite is counted per site | **Met** (28 tests; benchmark self-checks). First hardware runs in the loop: §8.6 |
 | R6 | Builds and tests with no robot and no vendor SDK | `colcon build` + `colcon test` on a machine with only Eigen3 | **Met** |
 | R7 | Filter cost never a reason to weaken a bound | Worst p99.9 ≤ 1 % of budget | **Met**: ≤ 40 ns `[MEASURED]` (§8.3) |
 
@@ -57,11 +58,12 @@ mounted, calibrated 6-axis wrist F/T sensor — a stated precondition, not an ac
   OBSERVATION SIDE (measured, flows up)        ACTION SIDE (commanded, flows down)
   ─────────────────────────────────────        ──────────────────────────────────────────────
   BaseCyclic feedback, 1 kHz                   policy action [F*n, vx, vy, wx, wy, wz]  (~30 Hz)
-     │ q_meas [deg] → [rad]  (loop, D-25)          │ F*n tool-z [N]; motion in TASK frame
+     │ q_meas [deg, wrapped] → [rad, signed]       │ F*n tool-z [N]; motion in TASK frame
+     │ (loop, D-25)                                │
      ▼                                              ▼
   computeFK(q_meas) ─► T_base [m]              SafetyFilter Site 1  clipForce(F*n)         THIS PKG
      │                                              ▼
-     ├─ getPosition → p_base [m]               admittance reflex (PI on −fz) → vz         (external)
+     ├─ getPosition → p_base [m]               admittance reflex (PI on −fz) → vz         (kinova_lowlevel)
      └─ getRotation → R, cols 0–1 = 6D obs          ▼
         NO Gram-Schmidt: nothing is ever       assemble twist_task [vx vy vz wx wy wz]
         reconstructed from the 6D vector            ▼
@@ -78,7 +80,7 @@ mounted, calibrated 6-axis wrist F/T sensor — a stated precondition, not an ac
                                                     ▼  q̇_safe
                                                q_send = q_send_prev + q̇_safe·dt  (commanded anchor, P19)
                                                     ▼
-                                               Refresh() → arm   (kinova-wrapper)
+                                               wrap to [0°, 360°) → Refresh() → arm   (kinova_lowlevel)
 
   Dotted dependency: q_meas (OBS) is also the point at which J is evaluated (ACTION). It is the
   only quantity that crosses sides, and it crosses as an input, never as a policy observation.
@@ -119,16 +121,23 @@ struct DlsResult {
 };
 ```
 
-**Two unit boundaries the caller owns, both known bug sources:**
+**Three boundaries the caller owns, all known bug sources:**
 
 1. **Task → base.** The policy and the reflex work in the task frame (latched at CONTACT entry).
    `jointVelocityDLS` takes a base-frame twist. Apply a **rotation only**, never the 4×4
    homogeneous transform: a twist is a vector pair, not a point, and applying the translation
    leaks a phantom offset.
-2. **rad/s → deg/s.** The loop integrates into `q_send`, which is in degrees (Kortex
-   `feedback.actuators(i).position()` is degrees `[SPEC]`). Convert at the integration step:
-   `q_send_deg += q̇_rad_s · (180/π) · dt`. Omitting it produces motion 57× too slow that looks
-   exactly like a damping problem.
+2. **rad ↔ deg.** `q_send` is integrated in radians inside `ControlCycle`
+   (`q_send += q̇·dt`, decided 30 Sep 2026) and converted to degrees once per cycle, where the
+   command is staged; Kortex positions are degrees `[SPEC]`. Omitting the conversion produces
+   motion 57× too slow that looks exactly like a damping problem.
+3. **wrapped ↔ signed.** Kortex reports and accepts positions wrapped to [0°, 360°)
+   `[SPEC — Kinova support, 4 Oct 2026]`. Site 3's position limits are symmetric about zero, so
+   everything between the two ends of the loop — the measured angles, the `q_send` integrator,
+   the filter — is in the signed convention, (−π, +π]. The loop converts every measured joint
+   to signed on the way in and wraps every commanded joint on the way out. FK and the Jacobian
+   are built from sines and cosines and are indifferent to the choice; `clipJoint` is not.
+   Getting this wrong is silent (§6, §8.6).
 
 **Not this library's job — and where it lives**
 
@@ -386,6 +395,11 @@ for. Why vz is excluded: two limiters in series on the force-controlled axis mak
 analysable. Decision D-07: engineered clipping with logged interventions; a formal barrier
 certificate is future work — a swap behind the same interface, not a retrain.
 
+Two preconditions the filter cannot check for itself, both met by the loop and both learned on
+hardware (§8.6): `q_send` reaches Site 3 in the signed convention, and the start state lies
+inside every refusal bound. The workspace box was widened on 7 Oct 2026 to contain the Home
+pose; values in `safety_filter.md`.
+
 ---
 
 ## 6 · Failure modes
@@ -401,6 +415,8 @@ certificate is future work — a swap behind the same interface, not a retrain.
 | q outside joint limits | not checked in the IK | Site 3 position refusal, single-step lookahead |
 | Non-finite input at any filter site | `isfinite` / `allFinite()` at each site | zero output, `NON_FINITE_REJECTED`, counted once per site; `pos_refused_mask = 0` |
 | inf in a filter input | same guard | Caught explicitly — `inf > bound` is *true*, so an unguarded site would log a phantom intervention into the O3 count |
+| `q_send` reaches Site 3 wrapped to [0, 2π) instead of signed | **not detectable in the filter** | Silent. A joint above π reads as far beyond its positive limit, so the directional refusal zeroes every positive rate and passes every negative one: the joint can only move one way. Observed on hardware 6 Oct 2026 (§8.6). Prevented at the loop's wrapped↔signed seam (§4) |
+| Tool tip outside the workspace box | counted (`workspace_refused`); not an error | Outward motion is zeroed, inward passes, so a commanded oscillation becomes one-signed travel that reads as drift. Observed on hardware 6 Oct 2026 (§8.6) |
 
 **`ok == false` means hold, not skip.** The loop's correct response is to keep `q_send` at its
 previous value and still call `Refresh()` — skipping the call trips the firmware watchdog.
@@ -442,7 +458,8 @@ zero from this DH table. Valid as an FK fixture (z = 1.1873 m validates the tabl
 anything conditioning-related and invalid as the loop's initialisation pose.
 
 **Pending:** 7. λ sweep — λ vs residual (nominal pose) and peak ‖q̇‖ (near-singular pose);
-selects production λ. Hardware FK-vs-Kortex (Step 3).
+selects production λ. First hardware evidence on the tracking side is in §8.6: 15 % overshoot
+on one axis at λ = 0.05 at the Home pose. Hardware FK-vs-Kortex (Step 3).
 
 **Determinism.** No randomness in gtest cases; `test_fk.cpp` uses a fixed seed (42).
 
@@ -502,8 +519,22 @@ mask 42; ALTERNATING 500,000 on every bound (confirms the table cycles), mask 42
 Mean-sum 1.90 µs + ~0.02 µs ≈ 1.9 µs; tail-sum 3.04 µs + 0.04 µs ≈ 3.1 µs. The p99.9 of a sum
 is not the sum of the p99.9s (that assumes perfectly correlated tails — conservative, not
 measured). The reportable composed number comes from instrumenting the assembled loop end to
-end (Step 8). Against the ~650 µs left after the ~350 µs mean `Refresh()` round-trip
-`[MEASURED on hardware, Step 3, kinova-wrapper]`, both estimates are go.
+end (Step 8).
+
+First end-to-end measurement `[MEASURED — hardware, `kinova_lowlevel` `step1_loop`, 7 Oct 2026,
+runs 1007_1556 (25,000 cycles) and 1007_1616 (60,000 cycles), RelWithDebInfo, `chrt -f 80
+taskset -c 2`]`:
+
+| Quantity | p50 | p99.9 |
+|---|---|---|
+| `Refresh()` round trip | 324 / 286 µs | 789 / 812 µs |
+| Adapter compute: cycle start to end of work, minus the round trip, differenced per cycle | 9.5 / 9.1 µs | 26 / 39 µs |
+
+The compute figure is the whole per-cycle chain as it runs — FK, Jacobian, manipulability, DLS,
+all three filter sites, integration, the gap check and the log record — so it is larger than
+the 1.9 µs sum above, and it is about 1 % of the cycle. Missed deadlines: 0 of 25,000 and 3 of
+60,000. These are microsecond-scale loop numbers; the clock-floor conflict of §8.5 concerns the
+nanosecond-scale benchmarks.
 
 ### 8.5 Clock floor — conflicted, not cited
 
@@ -511,7 +542,68 @@ Readings of 9 ns and 13 ns exist across sources for the same measurement. Resolv
 publishing any timing number (Step 9). No figure in this document depends on it except the
 5–30 ns bracket's interpretation, which holds under either value.
 
-### 8.6 Verification ledger
+### 8.6 Hardware runs in the 1 kHz loop — 6–7 Oct 2026
+
+Free space, no contact, reflex returning zero. `ScriptedSource`: vx 0.02 m/s at 0.2 Hz,
+vy 0.02 m/s at 0.3 Hz, wx 0.05 rad/s at 0.15 Hz, wz 0.10 rad/s at 0.25 Hz, held over a
+77-cycle policy period; task frame = base frame; λ = 0.05; start at the Home pose (joints
+nominally 0, 15, 180, 230, 0, 55, 90° as Kortex reports them; w = 0.0326). The commanded tip path is
+one-signed: x runs 0 → +3.18 cm → 0 and y runs 0 → +2.12 cm → 0, z is never commanded. Tip
+positions below are `computeFK` on the logged measured joints. Run folders are under
+`results/step3_hw/scripted_action/`.
+
+**The 6 Oct run — two silent one-way refusals.** `1006_1503_repeat_poseA_25s_expect_fault`,
+23,654 cycles before the arm faulted `[MEASURED]`:
+
+| Axis | Commanded | Measured |
+|---|---|---|
+| x | 0 → +3.18 cm → 0 | oscillation on a falling baseline, −13.1 cm net |
+| y | 0 → +2.12 cm → 0 | correct, returns each period |
+| z | none | −7.6 cm |
+| joint 4 `q_send` | — | never increased (0 of 23,653 cycles); −22.43° net; ended 4.6° past its limit |
+
+Cause: the tip started 7 cm outside the workspace box in x, and joint 4's `q_send` was in the
+wrapped convention, so both the Site 2 and the Site 3 refusal passed motion in one direction
+only (§6; `safety_filter.md`, *Hardware findings*). It was **not** null-space drift, which had
+been the working hypothesis: with both refusals removed the configuration barely moves (below).
+
+**The 7 Oct runs — after the signed-convention fix and the wider box** `[MEASURED]`:
+
+| Run | Cycles | Refusals (Site 3 mask) | Tip x range | Tip y range | Tip z range | Max command gap |
+|---|---:|---:|---|---|---|---|
+| `1007_1556_signed_ws080_poseA_25s` | 25,000 | 0 | −0.10…+3.08 cm | −0.01…+2.45 cm | −0.17…0.00 cm | 0.26° |
+| `1007_1616_signed_ws080_poseA_60s` | 60,000 | 0 | −0.23…+3.08 cm | −0.01…+2.46 cm | −0.34…0.00 cm | 0.27° |
+
+No HOLD cycles, no abort, no fault in either run.
+
+What the two runs establish:
+
+1. **Tracking error at λ = 0.05 is visible, and it is cross-axis.** The y peak is 2.45 cm
+   against 2.12 cm commanded (+15 %); the x peak is 3.08 cm against 3.18 cm (−3 %) `[MEASURED]`.
+   The same model at λ = 0.01 gives 2.13 cm and 3.17 cm `[COMPUTED — Python reimplementation]`,
+   which attributes the error to the damping rather than to the servo or the action hold. This
+   is the §5.3.3 accuracy cost, seen on hardware for the first time, and it is an input to the
+   λ sweep.
+2. **Open-loop drift is about 1 mm per 20 s.** Every scripted frequency completes whole periods
+   in 20 s, so the tip should be back at its start at cycles 20,000, 40,000 and 60,000. In the
+   60 s run it was at (−0.08, 0.00, −0.10), (−0.15, 0.00, −0.19) and (−0.24, −0.01, −0.29) cm
+   `[MEASURED]`: linear, about 0.08 cm in x and 0.10 cm in z per 20 s. Orientation error
+   against the start grows the same way, 0.21° at 20 s and 0.62° at 60 s. The chain has no
+   task-space position feedback, so this accumulates.
+3. **The redundancy does not wander.** After 60 s every joint is within 0.50° of where it
+   started `[MEASURED]`. The minimum-norm solution with no null-space term (§4) did not
+   reconfigure the arm over this motion.
+4. **The kinematic chain behaves as an independent model predicts.** A Python reimplementation
+   of FK, the finite-difference Jacobian, the DLS solve, the filter and a first-order servo
+   (τ = 15.7 ms) reproduces all three logged runs: tip within 0.08 cm and joint 4 within 0.07°
+   over every cycle `[COMPUTED vs MEASURED]`. For the two 7 Oct runs the ranges in the table
+   above were predicted before the arm moved.
+5. **Continuous joints crossed the 0°/360° command seam without incident.** Joints 1 and 5 sit
+   at 0° at this pose; their wrapped command crossed the seam 25 and 29 times in the 60 s run
+   and the command-to-measured gap peaked at 0.27° `[MEASURED]`. At these speeds the arm
+   takes the short way round.
+
+### 8.7 Verification ledger
 
 | Claim | Basis |
 |---|---|
@@ -521,6 +613,11 @@ publishing any timing number (Step 9). No figure in this document depends on it 
 | Filter worst p99.9 ≤ 40 ns; cost 5–30 ns | `[MEASURED]` bound; bracket from two bounds §8.3 |
 | Non-finite guard live at all three sites; mask 42; NOMINAL silent | `[MEASURED]` counter self-checks §8.3 |
 | No heap on the 1 kHz path | `[INFERRED]` from tail tightness; fixed-size Eigen throughout |
+| Chain runs on the arm inside the 1 kHz loop; 60,000 cycles of scripted motion, zero refusals, no fault | `[MEASURED]` §8.6 |
+| Adapter compute p50 ≈ 9 µs, p99.9 ≤ 39 µs on hardware | `[MEASURED]` §8.4 |
+| FK, Jacobian and DLS agree with an independent model on hardware, tip within 0.08 cm | `[COMPUTED vs MEASURED]` §8.6 |
+| Firmware does not enforce joint position limits in low-level servoing | `[SPEC]` Kinova support, 4 Oct 2026; consistent with the 6 Oct run §8.6 |
+| Kortex positions are wrapped to [0°, 360°); commands must be wrapped before sending | `[SPEC]` Kinova support, 4 Oct 2026 |
 | Joint velocity limits 120 / 200 °/s | `[SPEC]` Kortex actuator specification, Aug 2026; not confirmed by hardware test |
 | Joint position limits ±2.2515 / 2.5800 / 2.0996 rad | `[SPEC]` Kinova Gen3 User Guide Table 39 |
 | High-level library limits (Tables 40–41) not applied in low-level servoing | `[SPEC]` User Guide reading; `[UNVERIFIED]` by test |
@@ -541,29 +638,45 @@ publishing any timing number (Step 9). No figure in this document depends on it 
 | D-09 final bound values | O3 being meaningful | Trained action distribution |
 | D-14 tool offset | Hardware FK check | Step 3 records FK-vs-Kortex with the 7 mm accounted for |
 | D-20 manipulability metric | Singularity monitor in the loop | Wall-clock cost of each candidate against the remaining budget (§5.4) — measure before choosing |
-| D-27 joint-limit duplication and sentinel mismatch | Manifest schema; `pos_refused_mask` invariant | Single source of truth. ±2π (kinematics) vs ±1e9 (filter) are **not equivalent**: 2π refuses at 6.28 rad, 1e9 never refuses; a manifest adopting ±2π silently changes the mask from 42 to 127 |
-| Production λ | Hardware integration | λ sweep (§7 item 7) |
+| D-27 joint-limit duplication | Manifest schema; `pos_refused_mask` invariant | Single source of truth. As of 7 Oct 2026 both copies carry the same values and ±1e9 sentinels, but they are still two copies. The sentinel choice still matters for the manifest: ±2π and ±1e9 are **not equivalent** — 2π refuses at 6.28 rad, 1e9 never refuses — and a manifest adopting ±2π silently changes the mask from 42 to 127 |
+| Production λ | Hardware integration | λ sweep (§7 item 7). Hardware evidence at λ = 0.05: +15 % on one axis at the Home pose (§8.6) |
 | Adaptive λ | Second robot in MuJoCo | Measure a per-cycle σ_min estimate's cost first |
 | Position refusal: is bounding `q_send` enough? | Whether Site 3 needs a margin | Step 3 overshoot measurement on joints 2/4/6: peak `q_meas − q_send` after a step, several speeds. If zero, `v·dt` on `q_send` is correct and the `stop_horizon_s` rename is dropped; otherwise add margin ε to `SafetyBounds` (with D-04). τ = 15.7 ms is the lag, not the fix — a τ horizon applies only to a check made against `q_meas` |
-| `IKResult::joint_states` fill on failure (NaN vs zero) | Step 1 loop bring-up | Sahil decides |
 | Clock-floor conflict | Any published timing number | Re-measure under one protocol (Step 9) |
-| Firmware position-limit enforcement in low-level servoing | Whether Site 3 is the sole guard | SDK header grep, Kinova support, or an empirical test on joint 4 |
 | Sustained-intervention flag | Reflex integrator divergence under sustained scaling | Undecided whether the filter raises a flag or only counts |
+| Per-cycle logging of Site 2 refusals | Telling a workspace refusal from drift once the reflex drives vz | Undecided. Site 3's mask is logged per cycle; Site 2 is only counted |
+| Workspace box values | O3 being meaningful; the start pose lying inside the box | Provisional box set 7 Oct 2026 to contain the Home pose; final values with D-09 |
+
+**Closed since the last revision**
+
+| Item | Outcome |
+|---|---|
+| `IKResult::joint_states` fill on failure | Keep the last iterate (decided 11 Sep 2026): `solveIK` is offline and never commanded, and the last iterate shows where the solver stalled |
+| Firmware position-limit enforcement in low-level servoing | Not enforced `[SPEC — Kinova support, 4 Oct 2026]`. Site 3 is the sole guard |
+| Does the minimum-norm solution drift in the null space over the scripted motion? | No: joints within 0.50° of the start after 60 s (§8.6). A null-space term stays deferred |
 
 ---
 
 ## 10 · Limitations
 
-- Everything has run off-robot only. Hardware FK, τ on the limited joints, and firmware limit
-  behaviour are pending.
+- Hardware exposure so far is free-space scripted motion from one pose (§8.6). Still pending:
+  the FK-vs-Kortex comparison, τ on the limited joints, servo overshoot, and anything in
+  contact.
 - The Jacobian is numerical; `eps` is unswept.
 - One scalar λ across mixed-unit rows; λ is per-robot and must be re-tuned on every port.
-- The composed loop cost is an estimate; the clock floor is conflicted.
+- The composed loop cost is measured on hardware at microsecond resolution (§8.4); the
+  sum-of-benchmarks figure remains an estimate and the nanosecond clock floor is conflicted.
 - Site 2 mixes a task-frame twist with a base-frame position; valid only near axis alignment.
 - Site 3 bounds the commanded setpoint, not the measured joint. Lag alone cannot cause a
   violation; servo overshoot could, and is not measured (Step 3).
 - `SafetyBounds` defaults are header literals awaiting D-04/D-09; joint limits are duplicated
-  and drifted (D-27).
+  (D-27).
+- Refusals are directional, so a state that starts outside a refusal bound moves one way only,
+  silently. The filter relies on the caller for a start state inside the bounds and for the
+  signed angle convention at Site 3.
+- No task-space position feedback: the tip drifts about 1 mm per 20 s under scripted motion
+  (§8.6).
+- λ = 0.05 costs up to 15 % tracking error on one axis at the Home pose (§8.6).
 - The σ-spectrum and link-scale tables come from a Python reimplementation, not from this C++.
 - No literature is cited with authors here because none has been read in primary form.
 - Precondition inherited from the stack: an external, calibrated 6-axis wrist F/T sensor.
@@ -579,6 +692,8 @@ publishing any timing number (Step 9). No figure in this document depends on it 
 | 4 Sep 2026 | Step 6.2 IK benchmark and Step 6.4 filter benchmark closed; counter invariants verified over two runs; build flags verified |
 | Sep 2026 | Tool offset made a constructor parameter (D-14 bookkeeping); `manipulability()` monitor added; `max_iterations ≤ 0` guard added to `solveIK` |
 | 11 Sep 2026 | Documentation audited against `REPO_DOC_AUDIT_SPEC.md` v1.0: restructured to the required skeleton, provenance tags applied, clock floor withdrawn, composed cost relabelled as estimate |
+| 4 Oct 2026 | Kinova support answers recorded: joint limits not applied in low-level servoing; positions reported wrapped to [0°, 360°); commands must be wrapped |
+| 6–7 Oct 2026 | First scripted-motion hardware runs in the 1 kHz loop (`kinova_lowlevel`). Two silent one-way refusals found and removed: wrapped `q_send` at Site 3, tip outside the workspace box at Site 2. Workspace box widened. 25 s and 60 s runs clean. §4 boundary list, §6, §8.4, §8.6, §9 and §10 updated; null-space-drift hypothesis withdrawn |
 
 ---
 

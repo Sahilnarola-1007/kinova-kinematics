@@ -175,7 +175,12 @@ D-09 open]` until the manifest mechanism lands (D-04); nothing is sourced from a
 |-------|---------|-------|
 | `v_tan_max` | 0.15 | m/s |
 | `omega_max` | 0.50 | rad/s |
-| Workspace box | ±0.5 x, ±0.5 y, 0.05–0.70 z | m, base frame |
+| Workspace box | 0.10–0.80 x, −0.15–0.80 y, 0.02–0.90 z | m, base frame |
+
+The box was widened on 7 Oct 2026 `[DESIGN, provisional]`. The earlier box (±0.5 x, ±0.5 y,
+0.05–0.70 z) excluded the arm's Home pose: the tool tip sits at x = 0.570 m there `[COMPUTED —
+computeFK on the logged start pose, run 1007_1556]`, 7 cm outside the old x face. What that did
+on hardware is recorded under *Hardware findings* below.
 
 Reference `[SPEC — Kinova Gen3 User Guide, spherical wrist; Sahil to record the table number]`:
 Cartesian hard limits 0.5 m/s linear, 0.8727 rad/s (50 °/s) angular, 40 N force, 15 N·m torque.
@@ -192,6 +197,13 @@ Our defaults are within these.
 Joints 1, 3, 5, 7 are continuous rotation (no position limit). In code the sentinel is
 ±1e9, not infinity, so any limit test must compare against the sentinel threshold rather
 than calling `isinf`.
+
+**Angle convention — a precondition on `clipJoint`.** The position limits are symmetric about
+zero, so `q_send` must be in the signed convention, (−π, +π]. Kortex reports and accepts joint
+positions wrapped to [0°, 360°) `[SPEC — Kinova support, 4 Oct 2026]`, so the caller converts.
+The 1 kHz loop (`kinova_lowlevel`, `step1_loop`) does it at one seam: wrapped → signed on every
+measured joint on the way in, signed → wrapped on every commanded joint on the way out. The
+filter cannot detect a violation of this precondition; see *Hardware findings*.
 
 Note `[SPEC]`: the User Guide also lists high-level control library velocity limits
 (Table 40: 79.64 °/s / 69.91 °/s general; Table 41: 50 °/s admittance). These are read as
@@ -234,6 +246,12 @@ stopped guarding its input.
 refused. It is not accumulated in the counter. Because joints 1, 3, 5, 7 are continuous
 rotation, **the mask can never legally exceed 42** (`0b0101010`, bits 1/3/5 = joints
 2/4/6). A larger value means a sentinel was treated as a real limit.
+
+In the 1 kHz loop the mask of the most recent cycle is exposed by
+`ControlCycle::lastPosRefusedMask()` and logged per cycle by `step1_loop` as the
+`pos_refused_mask` column (added 7 Oct 2026). The cumulative counter is reachable through
+`ControlCycle::interventions()`. Site 2 refusals are counted there but are not yet logged per
+cycle.
 
 ### Why `inf` was the dangerous case
 
@@ -280,6 +298,10 @@ Coverage: each bound in isolation, sign preservation on Site 1, `vz` exclusion f
 Site 2 norms, inward-motion allowance at the workspace faces, uniform-scaling ratio
 preservation on Site 3, continuous-joint sentinel handling, and non-finite rejection at
 all three sites.
+
+Re-run after the workspace box change: `colcon test` on `kinova_kinematics` reports 47 tests,
+0 failures `[MEASURED — lab PC, hardware build tree, 7 Oct 2026]` (45 gtest cases plus the two
+binary-level CTest entries).
 
 ### Latency benchmark — `benchmark_safety_filter.cpp`
 
@@ -371,6 +393,59 @@ All four scenarios pass, exit 0. What each result establishes:
 
 ---
 
+## Hardware findings — 6–7 October 2026
+
+First runs of the filter inside the 1 kHz loop on the arm, free space, scripted motion
+(`ScriptedSource`: vx 0.02 m/s at 0.2 Hz, vy 0.02 m/s at 0.3 Hz, wx 0.05 rad/s at 0.15 Hz,
+wz 0.10 rad/s at 0.25 Hz; task frame = base frame; start at the Home pose). Run folders are
+under `results/step3_hw/scripted_action/`.
+
+### A directional refusal on a state that is already outside its bound is a one-way valve
+
+Both refusals pass inward motion on purpose, so that an arm that has left the bound can come
+back. The consequence: if the state *starts* outside the bound, every outward command is
+zeroed, every inward command passes, and a commanded oscillation turns into one-signed travel.
+Nothing faults and nothing looks wrong cycle by cycle. This happened at two sites in the same
+run, `1006_1503_repeat_poseA_25s_expect_fault` (23,654 cycles before the arm faulted):
+
+| Site | State outside its bound | What the arm did `[MEASURED — computeFK on logged q_meas]` |
+|------|-------------------------|-----------------------------------------------------------|
+| Site 2, workspace x | Tip at x = 0.570 m against `ws_x_max` = 0.50 m | Tip travelled −13.1 cm in x. Commanded: 0 → +3.2 cm → 0, never negative. |
+| Site 3, joint 4 | `q_send` seeded wrapped: 229.998° (4.01 rad) read against a +2.58 rad limit | `q_send` for joint 4 increased on 0 of 23,653 cycles and travelled −22.43°, ending 4.6° past its −147.82° limit, where the arm faulted. The tip fell 7.6 cm in z, an axis that was never commanded. |
+
+The y axis tracked correctly throughout: the tip was inside the y faces, and joint 4 contributes
+nothing to y at this pose.
+
+Attribution `[COMPUTED — independent Python reimplementation of FK, Jacobian, DLS, the three
+filter sites, the scripted source and a first-order servo, τ = 15.7 ms, λ = 0.05]`: with both
+mechanisms present the model reproduces the logged run to within 0.07 cm at the tip and 0.015°
+on joint 4 over all 23,654 cycles. In the model the workspace refusal fires on 7,546 cycles
+(cycles 77 to 12,550) and the joint 4 refusal on 8,832. Those two counts are model output — the
+6 Oct log carried neither a per-cycle mask nor the counter.
+
+The second case is an angle-convention error, not a filter defect: the directional test is
+correct and is unchanged. It is recorded here because the filter is where it showed.
+
+### After the two corrections
+
+Signed convention at the loop seam, workspace box widened. Same pose, same scripted source:
+
+| Run | Cycles | `pos_refused_mask` ≠ 0 | Tip x / y / z range [cm from start] | Result |
+|-----|-------:|-----------------------:|-------------------------------------|--------|
+| `1007_1556_signed_ws080_poseA_25s` | 25,000 | 0 | −0.10…+3.08 / −0.01…+2.45 / −0.17…0.00 | completed, no fault |
+| `1007_1616_signed_ws080_poseA_60s` | 60,000 | 0 | −0.23…+3.08 / −0.01…+2.46 / −0.34…0.00 | completed, no fault |
+
+Mask and completion `[MEASURED — step1_loop log]`; tip ranges `[MEASURED — computeFK on logged
+q_meas]`. Joint 4 moved in both directions (12,402 cycles positive, 12,514 negative in the 25 s
+run). The tip stayed between x = 0.567 and 0.600 m, y = 0.001 and 0.026 m, z = 0.430 and
+0.434 m over the 60 s run — inside the box on every axis, so the workspace refusal had nothing
+to fire on. The Site 2 counter itself was not printed in these runs.
+
+The y peak of 2.45 cm against 2.12 cm commanded is not a filter effect; it is the DLS damping
+at λ = 0.05 (`design.md` §8.6).
+
+---
+
 ## Limitations and future work
 
 - **Workspace box uses base-frame position but zeros task-frame velocity.** Correct
@@ -385,9 +460,20 @@ All four scenarios pass, exit 0. What each result establishes:
 - **Bound values:** genuinely blocked on the trained action distribution. The filter
   is built now with the struct; values land after training (D-09).
 
-- **D-27 — joint limit drift.** The limits differ between `KinovaKinematics.cpp`
-  (2.2497, 2.5795, 2.0996311) and `SafetyFilter.hpp` (2.2515, 2.5800, 2.0996). Two
-  sources of truth for one physical fact. A single manifest is required.
+- **D-27 — joint limits duplicated.** The limits are written twice, in `KinovaKinematics.cpp`
+  and in `SafetyFilter.hpp`: two sources of truth for one physical fact. As of 7 Oct 2026 the
+  two copies agree (±2.2515, ±2.5800, ±2.0996 rad on joints 2/4/6; ±1e9 sentinels on the
+  continuous joints), but nothing enforces that. A single manifest is required.
+
+- **A refusal on a state already outside its bound is silent and one-directional.** See
+  *Hardware findings*. Two consequences for the caller: the start state has to be inside every
+  refusal bound for commanded motion to be reproduced, and a refusal that is not logged per
+  cycle is indistinguishable from drift. Site 3's mask is logged per cycle; Site 2's refusal is
+  only counted.
+
+- **Site 3 trusts the angle convention of `q_send`.** Limits are symmetric about zero and the
+  filter has no way to tell a wrapped angle from a signed one. The conversion is the caller's
+  job (see *Bounds table*, Site 3).
 
 - **Position refusal bounds the commanded setpoint, not the measured joint.** `clipJoint`
   checks `q_send + q̇·dt` against the limit, `dt = pos_lookahead_dt` = 1 ms `[DESIGN]`. Under
@@ -401,10 +487,11 @@ All four scenarios pass, exit 0. What each result establishes:
   against `limit − ε`, rather than a change of horizon. If ε = 0 the current check stands
   unchanged and the `stop_horizon_s` rename is dropped.
 
-- **Low-level limit enforcement `[UNVERIFIED]`.** Whether the arm's own firmware refuses an
-  out-of-limit position command in low-level servoing mode is not established. Three
-  routes: grep the SDK headers for fault codes, ask Kinova, or an empirical test on joint
-  4. Until then the filter is assumed to be the only enforcement.
+- **Low-level limit enforcement — answered.** The firmware does not apply joint position
+  limits in low-level servoing: "Joint limits is a high level control feature that won't be
+  applied in low level" `[SPEC — Kinova support, 4 Oct 2026]`. Consistent with the 6 Oct run,
+  where joint 4 was commanded 4.6° past its limit before the arm faulted `[MEASURED]`. Site 3
+  is the only enforcement of the position limits on this path.
 
 - **Sustained-intervention flag.** Sustained admittance scaling drives integrator
   divergence. Whether the filter should raise a status flag on sustained intervention (as
@@ -424,5 +511,8 @@ All four scenarios pass, exit 0. What each result establishes:
 
 ---
 
-*Last updated: 11 September 2026 — documentation audit (provenance tags, clock floor withdrawn,
-test count corrected to 28). Benchmark closed 4 Sep 2026, Phase 0 Step 6.4.*
+*Last updated: 7 October 2026 — workspace box widened; first hardware findings recorded;
+angle-convention precondition on Site 3 stated; firmware limit question closed; D-27 wording
+corrected to the current code. Previous: 11 September 2026 — documentation audit (provenance
+tags, clock floor withdrawn, test count corrected to 28). Benchmark closed 4 Sep 2026, Phase 0
+Step 6.4.*

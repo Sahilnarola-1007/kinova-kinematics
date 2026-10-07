@@ -89,12 +89,12 @@ struct SafetyBounds
     double v_tan_max = 0.15;    ///< [m/s] [DESIGN] within the 0.5 m/s hard limit [SPEC]
     double omega_max = 0.50;    ///< [rad/s] [DESIGN] within the 0.8727 rad/s hard limit [SPEC]
 
-    double ws_x_min = -0.5;     ///< Workspace box [m], BASE frame [DESIGN]
-    double ws_x_max =  0.5;
-    double ws_y_min = -0.5;
-    double ws_y_max =  0.5;
-    double ws_z_min =  0.05;
-    double ws_z_max =  0.70;
+    double ws_x_min =  0.1;     ///< Workspace box [m], BASE frame [DESIGN]
+    double ws_x_max =  0.8;
+    double ws_y_min = -0.15;
+    double ws_y_max =  0.8;
+    double ws_z_min =  0.02;
+    double ws_z_max =  0.9;
 
     // Site 3 — joint space
     /// Per-joint velocity caps [rad/s]. [SPEC] Kortex actuator spec, Aug 2026; not confirmed
